@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "baram-wind-pipeline"
+version = "0.1.0"
+description = "BARAM 2026 wind power model comparison and inference pipeline"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+baram-run = "baram.workflows.training:main"
+baram-preprocess = "baram.features.preprocessing:main"

@@ -1,0 +1,24 @@
+# Core numerical and tabular stack
+numpy==2.4.6
+pandas==3.0.5
+scipy==1.18.0
+scikit-learn==1.9.0
+
+# EDA and Excel metadata
+matplotlib==3.11.1
+seaborn==0.13.2
+openpyxl==3.1.5
+
+# Notebook environment
+jupyterlab==4.6.2
+ipykernel==7.3.0
+nbformat==5.10.4
+
+# Utilities
+joblib==1.5.3
+tqdm==4.70.0
+
+# Competition modeling
+lightgbm==4.7.0
+catboost==1.2.10
+optuna==4.9.0
