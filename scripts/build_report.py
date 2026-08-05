@@ -12,21 +12,19 @@ import numpy as np
 import pandas as pd
 
 
-MODELS = ('lightgbm', 'catboost', 'tabm', 'realmlp', 'xrfm')
+MODELS = ('lightgbm', 'catboost', 'tabm', 'realmlp')
 TARGETS = ('kpx_group_1', 'kpx_group_2', 'kpx_group_3')
 DISPLAY_NAMES = {
     'lightgbm': 'LightGBM',
     'catboost': 'CatBoost',
     'tabm': 'TabM',
     'realmlp': 'RealMLP',
-    'xrfm': 'xRFM',
 }
 LOSS_NAMES = {
     'lightgbm': 'ficr-aware',
     'catboost': 'ficr-aware',
     'tabm': 'ficr-aware',
     'realmlp': 'ficr-aware',
-    'xrfm': 'kernel-ridge-mse',
 }
 
 

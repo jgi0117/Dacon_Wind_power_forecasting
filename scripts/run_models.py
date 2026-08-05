@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 SUPPORTED_MODELS = (
-    'lightgbm', 'catboost', 'tabm', 'realmlp', 'xrfm',
+    'lightgbm', 'catboost', 'tabm', 'realmlp',
 )
 ALIASES = {'all': SUPPORTED_MODELS}
 

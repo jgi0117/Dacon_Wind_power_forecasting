@@ -1,7 +1,7 @@
 '''Shared names and defaults that do not depend on model implementations.'''
 
 SUPPORTED_MODEL_NAMES = (
-    'lightgbm', 'catboost', 'tabm', 'realmlp', 'xrfm',
+    'lightgbm', 'catboost', 'tabm', 'realmlp',
 )
 DEFAULT_MODEL_NAMES = ('lightgbm', 'catboost')
 ITERATION_MODEL_NAMES: tuple[str, ...] = ()

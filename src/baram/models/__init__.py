@@ -31,9 +31,6 @@ def build_model(
     if name == 'realmlp':
         from .realmlp_model import RealMLPModel
         return RealMLPModel(config, epochs=iterations)
-    if name == 'xrfm':
-        from .xrfm_model import XRFMModel
-        return XRFMModel(config, iterations=iterations)
     raise ValueError(f'Unsupported model: {name}')
 
 

@@ -6,13 +6,12 @@ Version 1 코드는 Git tag [v1.0.0](https://github.com/jgi0117/Dacon_Wind_power
 
 ## 1. 프로젝트 개요
 
-기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개 그룹(kpx_group_1~3)을 예측하는 회귀 프로젝트입니다. 다음 5개 모델을 동일한 전처리, 시간 분할, 최대 20단계 학습 조건에서 비교합니다.
+기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개 그룹(kpx_group_1~3)을 예측하는 회귀 프로젝트입니다. Version 2에서는 다음 4개 모델을 동일한 전처리, 시간 분할, 학습 조건에서 비교합니다.
 
 - LightGBM
 - CatBoost
 - TabM
 - RealMLP
-- xRFM
 
 평가식은 다음과 같습니다.
 
@@ -45,7 +44,7 @@ Version 1 코드는 Git tag [v1.0.0](https://github.com/jgi0117/Dacon_Wind_power
 4. 2024년 7~12월은 모델 간 최종 비교 구간으로 유지합니다.
 5. 선택한 단계 수로 각 타깃의 사용 가능한 전체 과거 데이터를 다시 학습해 테스트를 예측합니다.
 
-세 타깃은 각각 독립적으로 학습합니다. 모든 모델은 조기 종료로 실행 길이를 줄이지 않고 최대 20 epoch 또는 round를 수행한 뒤 validation loss가 가장 좋은 단계를 최종 재학습 길이로 사용합니다.
+세 타깃은 각각 독립적으로 학습합니다. 현재 기본값은 최대 200 epoch 또는 boosting round이며, validation loss가 가장 좋은 단계를 최종 재학습 길이로 사용합니다. --max-epochs로 실행 길이를 변경할 수 있습니다.
 
 ### FICR-aware loss
 
@@ -61,16 +60,13 @@ Version 1 코드는 Git tag [v1.0.0](https://github.com/jgi0117/Dacon_Wind_power
 | CatBoost | custom objective/evaluation metric | round별 train loss, validation loss, score |
 | TabM | PyTorch FICR-aware loss | epoch별 train loss, validation loss, score |
 | RealMLP | PyTabKit custom train/validation metric | epoch별 train loss, validation loss, score |
-| xRFM | kernel-ridge 학습 유지, FICR-aware 모델 선택 | iteration별 평균 leaf validation loss와 score |
-
-xRFM의 내부 predictor는 kernel-ridge 방식이므로 외부 custom loss로 교체할 수 없습니다. 따라서 xRFM만 실제 학습 objective는 MSE 계열로 유지되며 FICR-aware loss는 iteration 선택에 반영됩니다. 또한 라이브러리가 leaf별 train loss를 노출하지 않아 xRFM의 train loss는 비어 있습니다.
 
 ## 4. 실행 방법과 산출물
 
 환경을 구성한 뒤 전체 모델을 순차 실행합니다.
 
     .\scripts\setup_env.ps1
-    .\scripts\run_models.ps1 -Models lightgbm,catboost,tabm,realmlp,xrfm -Device cpu
+    .\scripts\run_models.ps1 -Models lightgbm,catboost,tabm,realmlp -Device cpu
 
 FICR 비중이나 temperature를 변경하는 예:
 
