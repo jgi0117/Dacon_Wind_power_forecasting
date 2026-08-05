@@ -12,8 +12,6 @@
 
 ![DACON components](figures/dacon_components.png)
 
-![Training curves](figures/training_curves.png)
 
-The existing baseline runs predate loss-history collection, so their curve panels explicitly show that no history was recorded. Re-running a model populates the available train/validation history automatically.
 
 Entered DACON score components are preserved when this report is rebuilt.

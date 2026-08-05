@@ -299,20 +299,27 @@ def main() -> None:
     results.to_csv(results_path, index=False, encoding='utf-8')
     groups.to_csv(output / 'group_metrics.csv', index=False, encoding='utf-8')
     training.to_csv(output / 'training_summary.csv', index=False, encoding='utf-8')
-    history.to_csv(output / 'training_history.csv', index=False, encoding='utf-8')
+    history_path = output / 'training_history.csv'
+    history_figure = figures / 'training_curves.png'
+    if history.empty:
+        history_path.unlink(missing_ok=True)
+        history_figure.unlink(missing_ok=True)
+    else:
+        history.to_csv(history_path, index=False, encoding='utf-8')
+        _plot_histories(history, history_figure)
     monthly.to_csv(output / 'monthly_metrics.csv', index=False, encoding='utf-8')
     _plot_scores(results, figures / 'score_comparison.png')
     _plot_dacon_components(results, figures / 'dacon_components.png')
-    _plot_histories(history, figures / 'training_curves.png')
+    history_section = (
+        '\n\n![Training curves](figures/training_curves.png)\n\n'
+        if not history.empty else '\n\n'
+    )
     (output / 'RESULTS.md').write_text(
         '# Baseline results\n\n'
         + _markdown_table(results)
         + '\n\n![Validation score](figures/score_comparison.png)\n\n'
         + '![DACON components](figures/dacon_components.png)\n\n'
-        + '![Training curves](figures/training_curves.png)\n\n'
-        + 'The existing baseline runs predate loss-history collection, so their '
-        + 'curve panels explicitly show that no history was recorded. Re-running '
-        + 'a model populates the available train/validation history automatically.\n\n'
+        + history_section
         + 'Entered DACON score components are preserved when this report is rebuilt.\n',
         encoding='utf-8',
     )

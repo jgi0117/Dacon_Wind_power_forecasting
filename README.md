@@ -70,10 +70,6 @@
 
 ![DACON 1-NMAE와 FICR 비교](reports/baseline/figures/dacon_components.png)
 
-![모델별 train/validation loss 변화](reports/baseline/figures/training_curves.png)
-
-현재 보존된 baseline 실행은 loss-history 저장 기능을 추가하기 전에 생성되어 epoch별 수치가 없습니다. 따라서 위 곡선에는 임의 값을 만들지 않고 해당 사실을 표시했습니다. 이후 모델을 재실행하면 기록 가능한 train/validation loss가 training_history.csv와 그래프에 자동 반영됩니다. xRFM은 leaf별 재귀 학습 구조라 하나의 전역 train/validation loss 곡선을 제공하지 않습니다.
-
 ### 결과 해석과 Version 2 가설
 
 DACON score의 모델 간 범위는 0.01128로 작습니다. 특히 1-NMAE 범위는 0.00223에 불과하지만 FICR 범위는 0.02459이며, 이 5개 결과 안에서는 최종 score와 FICR의 상관계수가 0.999입니다. 표본이 모델 5개뿐이므로 일반화할 수는 없지만, 현재 모델 순위가 사실상 FICR 차이로 결정된다는 근거는 충분합니다.
@@ -86,10 +82,3 @@ Version 2에서는 FICR을 더 강하게 반영하되, 계단형인 원래 FICR 
 - [group_metrics.csv](reports/baseline/group_metrics.csv): 모델·타깃별 지표
 - [monthly_metrics.csv](reports/baseline/monthly_metrics.csv): 월별 지표
 - [training_summary.csv](reports/baseline/training_summary.csv): 타깃별 최적 학습 길이와 소요 시간
-- [training_history.csv](reports/baseline/training_history.csv): 재실행 시 수집되는 epoch/iteration 이력
-
-## 5. 버전 관리 방침
-
-현재 baseline 비교와 의사결정이 끝나면 이 상태를 Version 1 Git tag로 보존합니다. 그 뒤 main은 Version 2 전략으로 진행합니다. Version 2 README는 **1. 프로젝트 개요**와 **2. 데이터 전처리 방식**을 공통으로 유지하고, **3절 이후**를 선택된 모델과 학습·앙상블 전략에 맞게 변경합니다.
-
-아직 baseline 의사결정 전이므로 Version 1 tag는 만들지 않습니다.
