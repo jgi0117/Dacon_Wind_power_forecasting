@@ -12,18 +12,12 @@ import numpy as np
 import pandas as pd
 
 
-MODELS = ('lightgbm', 'catboost', 'tabm', 'realmlp')
+MODELS = ('realmlp',)
 TARGETS = ('kpx_group_1', 'kpx_group_2', 'kpx_group_3')
 DISPLAY_NAMES = {
-    'lightgbm': 'LightGBM',
-    'catboost': 'CatBoost',
-    'tabm': 'TabM',
     'realmlp': 'RealMLP',
 }
 LOSS_NAMES = {
-    'lightgbm': 'ficr-aware',
-    'catboost': 'ficr-aware',
-    'tabm': 'ficr-aware',
     'realmlp': 'ficr-aware',
 }
 
@@ -115,7 +109,7 @@ def _result_frames(
                 ),
                 'selection_metric': metadata.get(
                     'selection_metric',
-                    'mae' if model in {'lightgbm', 'catboost'} else 'competition-score',
+                    'ficr-aware-loss',
                 ),
                 'elapsed_seconds': metadata.get('elapsed_seconds'),
             })
@@ -165,7 +159,7 @@ def _plot_scores(results: pd.DataFrame, path: Path) -> None:
         )
         ax.legend()
     ax.set_xlabel('Score (higher is better)')
-    ax.set_title('Version 2 chronological validation score')
+    ax.set_title('Version 3 RealMLP chronological validation score')
     lower = max(0.0, float(ordered['validation_score'].min()) - 0.03)
     upper_values = [float(ordered['validation_score'].max())]
     if ordered['dacon_score'].notna().any():
@@ -263,9 +257,9 @@ def _markdown_table(results: pd.DataFrame) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '--runs-dir', type=Path, default=Path('model_outputs/v2/runs')
+        '--runs-dir', type=Path, default=Path('model_outputs/v3/runs')
     )
-    parser.add_argument('--output-dir', type=Path, default=Path('reports/v2'))
+    parser.add_argument('--output-dir', type=Path, default=Path('reports/v3'))
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     runs_dir = args.runs_dir if args.runs_dir.is_absolute() else root / args.runs_dir
@@ -304,7 +298,7 @@ def main() -> None:
         if not realmlp_history.empty else '\n\n'
     )
     (output / 'RESULTS.md').write_text(
-        '# Version 2 results\n\n'
+        '# Version 3 RealMLP results\n\n'
         + _markdown_table(results)
         + '\n\n![Validation score](figures/score_comparison.png)\n\n'
         + '![DACON components](figures/dacon_components.png)\n\n'

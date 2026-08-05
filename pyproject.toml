@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "baram-wind-pipeline"
 version = "0.1.0"
-description = "BARAM 2026 wind power model comparison and inference pipeline"
+description = "BARAM 2026 RealMLP wind power training and inference pipeline"
 requires-python = ">=3.11"
 
 [tool.setuptools.packages.find]

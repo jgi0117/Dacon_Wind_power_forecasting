@@ -17,17 +17,10 @@ class PipelineConfig:
     artifacts_dir: Path = Path('artifacts')
     data_dir: Path = Path('data')
     output_dir: Path = Path('model_outputs')
-    iteration_cache_dir: Path = Path('model_outputs')
     models: tuple[str, ...] = DEFAULT_MODEL_NAMES
     validation_start: str = '2024-01-01 01:00:00'
     iteration_selection_end: str = '2024-04-01 01:00:00'
     comparison_start: str = '2024-07-01 01:00:00'
-    iteration_fold_starts: tuple[str, ...] = (
-        '2023-04-01 01:00:00',
-        '2023-07-01 01:00:00',
-        '2023-10-01 01:00:00',
-        '2024-01-01 01:00:00',
-    )
     seed: int = 42
     n_jobs: int = -1
     max_epochs: int = 200
@@ -39,7 +32,6 @@ class PipelineConfig:
     ficr_temperature: float = 0.01
     device: str | None = None
     evaluation_only: bool = False
-    refresh_iterations: bool = False
 
 
 def parse_args() -> PipelineConfig:
@@ -50,14 +42,11 @@ def parse_args() -> PipelineConfig:
     parser.add_argument('--data-dir', type=Path, default=Path('data'))
     parser.add_argument('--output-dir', type=Path, default=None)
     parser.add_argument(
-        '--iteration-cache-dir', type=Path, default=Path('model_outputs')
-    )
-    parser.add_argument(
         '--models',
         nargs='+',
         choices=SUPPORTED_MODEL_NAMES + ('all',),
         default=None,
-        help='Models to run, for example: --models tabm realmlp',
+        help='Only RealMLP is supported in Version 3.',
     )
     parser.add_argument('--validation-start', default='2024-01-01 01:00:00')
     parser.add_argument('--iteration-selection-end', default='2024-04-01 01:00:00')
@@ -73,7 +62,6 @@ def parse_args() -> PipelineConfig:
     parser.add_argument('--ficr-temperature', type=float, default=0.01)
     parser.add_argument('--device', default=None, help='cpu, cuda, or omit for auto')
     parser.add_argument('--evaluation-only', action='store_true')
-    parser.add_argument('--refresh-iterations', action='store_true')
     values = vars(parser.parse_args())
     positive_options = (
         'max_epochs', 'early_stopping_patience', 'batch_size',
@@ -101,8 +89,8 @@ def parse_args() -> PipelineConfig:
     output_dir = values.pop('output_dir')
     if output_dir is None:
         output_dir = (
-            Path('model_outputs')
+            Path('model_outputs/v3/runs/realmlp')
             if requested_models is None
-            else Path('model_outputs') / 'runs' / '_'.join(models)
+            else Path('model_outputs/v3/runs') / '_'.join(models)
         )
     return PipelineConfig(models=models, output_dir=output_dir, **values)

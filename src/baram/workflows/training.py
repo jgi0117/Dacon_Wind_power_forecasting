@@ -13,9 +13,8 @@ import numpy as np
 import pandas as pd
 
 from ..config import PipelineConfig, parse_args
-from ..constants import EPOCH_MODEL_NAMES, ITERATION_MODEL_NAMES, SUPPORTED_MODEL_NAMES
+from ..constants import SUPPORTED_MODEL_NAMES
 from ..data import load_artifacts, write_submission
-from .iteration_cache import load_iteration_cache, save_iteration_cache
 from ..metrics import (
     TARGET_COLS,
     capacity_factor,
@@ -24,13 +23,7 @@ from ..metrics import (
     restore_generation,
 )
 from ..models import build_model
-from ..splitting import (
-    IterationFold,
-    SplitPlan,
-    build_iteration_folds,
-    build_split_plan,
-    delivery_month,
-)
+from ..splitting import SplitPlan, build_split_plan, delivery_month
 
 
 LOGGER = logging.getLogger("baram.pipeline")
@@ -51,82 +44,6 @@ def _json_default(value: Any) -> Any:
     if isinstance(value, (np.integer, np.floating)):
         return value.item()
     return str(value)
-
-
-def _select_iteration_schedule(
-    config: PipelineConfig,
-    X_train: pd.DataFrame,
-    y_train: pd.DataFrame,
-    folds: list[IterationFold],
-    model_names: tuple[str, ...],
-) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, Any]]]:
-    """여러 시계열 fold의 best iteration 중앙값을 그룹별로 선택한다."""
-    schedule: dict[str, dict[str, int]] = {
-        model_name: {} for model_name in model_names
-    }
-    audit: dict[str, dict[str, Any]] = {
-        model_name: {} for model_name in model_names
-    }
-    for target in TARGET_COLS:
-        for model_name in model_names:
-            fold_iterations: list[int] = []
-            fold_audit: list[dict[str, Any]] = []
-            for fold in folds:
-                train_mask = np.asarray(X_train.index < fold.train_cutoff)
-                train_mask &= y_train[target].notna().to_numpy()
-                valid_mask = np.asarray(
-                    (X_train.index >= fold.validation_start)
-                    & (X_train.index < fold.validation_end)
-                )
-                valid_mask &= y_train[target].notna().to_numpy()
-                X_fold_train = X_train.loc[train_mask]
-                X_fold_valid = X_train.loc[valid_mask]
-                if X_fold_train.empty or X_fold_valid.empty:
-                    raise ValueError(
-                        f"{model_name}/{target}/{fold.name}: 학습 또는 검증 행이 없습니다."
-                    )
-                if X_fold_train.index.max() >= fold.train_cutoff:
-                    raise RuntimeError("iteration fold 학습 정답 cutoff 위반입니다.")
-                y_fold_train = capacity_factor(
-                    y_train.loc[train_mask, target], target
-                )
-                y_fold_valid = capacity_factor(
-                    y_train.loc[valid_mask, target], target
-                )
-                LOGGER.info(
-                    "반복 수 탐색: %s / %s / %s", model_name, target, fold.name
-                )
-                model = build_model(model_name, config)
-                model.fit(X_fold_train, y_fold_train, X_fold_valid, y_fold_valid)
-                best_iteration = int(model.metadata()["best_iteration"])
-                fold_iterations.append(best_iteration)
-                fold_audit.append(
-                    {
-                        "fold": fold.name,
-                        "train_end": X_fold_train.index.max(),
-                        "train_cutoff_exclusive": fold.train_cutoff,
-                        "validation_start": X_fold_valid.index.min(),
-                        "validation_end": X_fold_valid.index.max(),
-                        "n_train_rows": len(X_fold_train),
-                        "n_validation_rows": len(X_fold_valid),
-                        "best_iteration": best_iteration,
-                    }
-                )
-            median_iteration = max(1, int(round(float(np.median(fold_iterations)))))
-            schedule[model_name][target] = median_iteration
-            audit[model_name][target] = {
-                "folds": fold_audit,
-                "fold_best_iterations": fold_iterations,
-                "median_best_iteration": median_iteration,
-            }
-            LOGGER.info(
-                "반복 수 중앙값: %s / %s = %d (%s)",
-                model_name,
-                target,
-                median_iteration,
-                fold_iterations,
-            )
-    return schedule, audit
 
 
 def _fit_validation_models(
@@ -162,12 +79,9 @@ def _fit_validation_models(
                 iterations,
             )
             model = build_model(model_name, config, iterations=iterations)
-            if model_name in EPOCH_MODEL_NAMES:
-                model.fit(X_target, y_target, X_tune, y_tune)
-                best_iteration = int(model.metadata()['best_iteration'])
-                iteration_schedule.setdefault(model_name, {})[target] = best_iteration
-            else:
-                model.fit(X_target, y_target)
+            model.fit(X_target, y_target, X_tune, y_tune)
+            best_iteration = int(model.metadata()['best_iteration'])
+            iteration_schedule.setdefault(model_name, {})[target] = best_iteration
             arrays[model_name][:, target_index] = restore_generation(
                 model.predict(X_validation), target
             )
@@ -264,39 +178,9 @@ def run_pipeline(config: PipelineConfig) -> pd.DataFrame:
         raise ValueError("Duplicate model names are not allowed.")
     X_train, y_train, X_test = load_artifacts(config.artifacts_dir)
     plan = build_split_plan(X_train, X_test, config)
-    iteration_models = tuple(
-        name for name in config.models if name in ITERATION_MODEL_NAMES
-    )
-    iteration_folds = build_iteration_folds(X_train, config) if iteration_models else []
-    cached_iterations = (
-        load_iteration_cache(
-            config,
-            X_train,
-            iteration_folds,
-            required_models=iteration_models,
-        )
-        if iteration_models
-        else ({}, {})
-    )
-    if cached_iterations is None:
-        iteration_schedule, iteration_audit = _select_iteration_schedule(
-            config, X_train, y_train, iteration_folds, iteration_models
-        )
-        cache_path = save_iteration_cache(
-            config, X_train, iteration_folds, iteration_schedule, iteration_audit
-        )
-        LOGGER.info("반복 수 탐색 결과 저장: %s", cache_path)
-    else:
-        iteration_schedule, iteration_audit = cached_iterations
-        if iteration_models:
-            LOGGER.info(
-                "저장된 반복 수 탐색 결과를 재사용합니다: %s",
-                config.iteration_cache_dir / "iteration_selection_cache.json",
-            )
-    iteration_schedule = {
-        name: iteration_schedule[name] for name in iteration_models
-    }
-    iteration_audit = {name: iteration_audit[name] for name in iteration_models}
+    iteration_folds: list[Any] = []
+    iteration_schedule: dict[str, dict[str, int]] = {}
+    iteration_audit: dict[str, Any] = {}
     fit_mask, validation_mask, early_stopping_mask, comparison_mask = _build_masks(
         X_train, plan
     )

@@ -18,7 +18,4 @@ nbformat==5.10.4
 joblib==1.5.3
 tqdm==4.70.0
 
-# Competition modeling
-lightgbm==4.7.0
-catboost==1.2.10
-optuna==4.9.0
+# Version 3 model dependencies are pinned in requirements-py313.txt.

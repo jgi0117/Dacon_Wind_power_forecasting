@@ -17,17 +17,6 @@ def build_model(
     *,
     iterations: int | None = None,
 ) -> RegressionModel:
-    if name == 'lightgbm':
-        from .lightgbm_model import LightGBMModel
-
-        return LightGBMModel(config, iterations=iterations)
-    if name == 'catboost':
-        from .catboost_model import CatBoostModel
-
-        return CatBoostModel(config, iterations=iterations)
-    if name == 'tabm':
-        from .tabm_model import TabMModel
-        return TabMModel(config, epochs=iterations)
     if name == 'realmlp':
         from .realmlp_model import RealMLPModel
         return RealMLPModel(config, epochs=iterations)

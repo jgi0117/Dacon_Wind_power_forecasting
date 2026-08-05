@@ -20,14 +20,6 @@ class SplitPlan:
     final_fit_cutoff: pd.Timestamp
 
 
-@dataclass(frozen=True)
-class IterationFold:
-    name: str
-    train_cutoff: pd.Timestamp
-    validation_start: pd.Timestamp
-    validation_end: pd.Timestamp
-
-
 def forecast_cutoff(batch_start: pd.Timestamp) -> pd.Timestamp:
     """01시에 시작하는 예측 배치의 전일 14시 예측기준시점을 반환한다."""
     batch_start = pd.Timestamp(batch_start)
@@ -78,40 +70,6 @@ def build_split_plan(
         test_start=test_start,
         final_fit_cutoff=forecast_cutoff(test_start),
     )
-
-
-def build_iteration_folds(
-    X_train: pd.DataFrame,
-    config: PipelineConfig,
-) -> list[IterationFold]:
-    """반복 수 선택용 expanding-window fold를 생성한다.
-
-    각 fold의 학습 정답은 검증 배치 시작 전일 14시 미만으로 제한된다.
-    검증 구간은 다음 fold 시작 전까지이며, 마지막 fold는 앙상블 보정 시작
-    직전까지 사용한다.
-    """
-    starts = [pd.Timestamp(value) for value in config.iteration_fold_starts]
-    if starts != sorted(set(starts)):
-        raise ValueError("iteration_fold_starts는 중복 없는 오름차순이어야 합니다.")
-    iteration_selection_end = pd.Timestamp(config.iteration_selection_end)
-    if not starts or starts[-1] >= iteration_selection_end:
-        raise ValueError("마지막 iteration fold는 iteration_selection_end보다 앞서야 합니다.")
-    ends = starts[1:] + [iteration_selection_end]
-    folds: list[IterationFold] = []
-    for index, (start, end) in enumerate(zip(starts, ends, strict=True), start=1):
-        _validate_batch_boundary(X_train, start, f"iteration_fold_{index}_start")
-        _validate_batch_boundary(X_train, end, f"iteration_fold_{index}_end")
-        if start >= end:
-            raise ValueError(f"iteration_fold_{index}의 검증 구간이 비어 있습니다.")
-        folds.append(
-            IterationFold(
-                name=f"fold_{index}",
-                train_cutoff=forecast_cutoff(start),
-                validation_start=start,
-                validation_end=end,
-            )
-        )
-    return folds
 
 
 def delivery_month(index: pd.DatetimeIndex) -> pd.PeriodIndex:

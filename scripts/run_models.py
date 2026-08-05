@@ -8,9 +8,7 @@ import sys
 from pathlib import Path
 
 
-SUPPORTED_MODELS = (
-    'lightgbm', 'catboost', 'tabm', 'realmlp',
-)
+SUPPORTED_MODELS = ('realmlp',)
 ALIASES = {'all': SUPPORTED_MODELS}
 
 
@@ -49,9 +47,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     parser.add_argument(
-        '--runs-dir', type=Path, default=Path('model_outputs/v2/runs')
+        '--runs-dir', type=Path, default=Path('model_outputs/v3/runs')
     )
-    parser.add_argument('--report-dir', type=Path, default=Path('reports/v2'))
+    parser.add_argument('--report-dir', type=Path, default=Path('reports/v3'))
     parser.add_argument('--reuse-completed', action='store_true')
     parser.add_argument('--evaluation-only', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
