@@ -103,19 +103,3 @@ LightGBM과 CatBoost는 train/validation 결과가 baseline보다 크게 낮아 
 다음 실험은 RealMLP만 200 epoch까지 학습합니다. 200개 epoch를 모두 실행하되 FICR-aware validation loss가 가장 낮은 epoch를 최종 재학습 길이로 선택합니다. train/validation loss 그래프도 이 RealMLP 실행만 README와 reports/v2에 사용합니다.
 
 ![RealMLP 200-epoch train/validation loss](reports/v2/figures/training_curves.png)
-
-## 6. Version 1 baseline 결과
-
-| 검증 순위 | 모델 | 검증 score | DACON score | DACON 1-NMAE | DACON FICR |
-|---:|---|---:|---:|---:|---:|
-| 1 | RealMLP | 0.620703 | 0.624299 | 0.870005 | 0.378593 |
-| 2 | LightGBM | 0.616430 | 0.620163 | 0.870725 | 0.369600 |
-| 3 | TabM | 0.615825 | 0.613019 | 0.872039 | 0.353999 |
-| 4 | CatBoost | 0.612603 | 0.621374 | 0.869805 | 0.372943 |
-| 5 | xRFM | 0.598697 | 0.614580 | 0.870831 | 0.358329 |
-
-![Version 1 score 비교](reports/baseline/figures/score_comparison.png)
-
-![Version 1 DACON 구성 지표](reports/baseline/figures/dacon_components.png)
-
-DACON score의 모델 간 범위는 0.01128입니다. 1-NMAE 범위는 0.00223인 반면 FICR 범위는 0.02459였으며, 이 5개 결과 안에서 최종 score와 FICR의 상관계수는 0.999였습니다. 표본 수가 작으므로 Version 2에서는 soft-FICR 학습이 실제 비교 구간과 DACON 점수를 함께 개선하는지 대조해야 합니다.
