@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Any
@@ -21,34 +22,26 @@ DISPLAY_NAMES = {
     'xrfm': 'xRFM',
 }
 LOSS_NAMES = {
-    'lightgbm': 'mae',
-    'catboost': 'mae',
-    'tabm': 'mse',
-    'realmlp': 'mae',
-    'xrfm': 'kernel-ridge-objective',
+    'lightgbm': 'ficr-aware',
+    'catboost': 'ficr-aware',
+    'tabm': 'ficr-aware',
+    'realmlp': 'ficr-aware',
+    'xrfm': 'kernel-ridge-mse',
 }
 
 
-def _report_path(root: Path, model: str) -> Path:
-    run_path = root / 'model_outputs' / 'runs' / model / 'run_report.json'
-    if run_path.is_file():
-        return run_path
-    return root / 'model_outputs' / 'run_report.json'
+def _report_path(runs_dir: Path, model: str) -> Path:
+    return runs_dir / model / 'run_report.json'
 
 
-def _monthly_path(root: Path, model: str) -> Path:
-    run_path = (
-        root / 'model_outputs' / 'runs' / model / 'evaluation_results_by_month.csv'
-    )
-    if run_path.is_file():
-        return run_path
-    return root / 'model_outputs' / 'evaluation_results_by_month.csv'
+def _monthly_path(runs_dir: Path, model: str) -> Path:
+    return runs_dir / model / 'evaluation_results_by_month.csv'
 
 
-def _load_reports(root: Path) -> dict[str, dict[str, Any]]:
+def _load_reports(runs_dir: Path) -> dict[str, dict[str, Any]]:
     reports: dict[str, dict[str, Any]] = {}
     for model in MODELS:
-        path = _report_path(root, model)
+        path = _report_path(runs_dir, model)
         if not path.is_file():
             continue
         payload = json.loads(path.read_text(encoding='utf-8'))
@@ -149,10 +142,10 @@ def _history_frame(reports: dict[str, dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
-def _monthly_frame(root: Path) -> pd.DataFrame:
+def _monthly_frame(runs_dir: Path) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for model in MODELS:
-        path = _monthly_path(root, model)
+        path = _monthly_path(runs_dir, model)
         if path.is_file():
             frame = pd.read_csv(path)
             frames.append(frame.loc[frame['model'] == model])
@@ -174,7 +167,7 @@ def _plot_scores(results: pd.DataFrame, path: Path) -> None:
         )
         ax.legend()
     ax.set_xlabel('Score (higher is better)')
-    ax.set_title('Baseline chronological validation score')
+    ax.set_title('Version 2 chronological validation score')
     lower = max(0.0, float(ordered['validation_score'].min()) - 0.03)
     upper_values = [float(ordered['validation_score'].max())]
     if ordered['dacon_score'].notna().any():
@@ -282,11 +275,18 @@ def _markdown_table(results: pd.DataFrame) -> str:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--runs-dir', type=Path, default=Path('model_outputs/v2/runs')
+    )
+    parser.add_argument('--output-dir', type=Path, default=Path('reports/v2'))
+    args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    output = root / 'reports' / 'baseline'
+    runs_dir = args.runs_dir if args.runs_dir.is_absolute() else root / args.runs_dir
+    output = args.output_dir if args.output_dir.is_absolute() else root / args.output_dir
     figures = output / 'figures'
     figures.mkdir(parents=True, exist_ok=True)
-    reports = _load_reports(root)
+    reports = _load_reports(runs_dir)
     if not reports:
         raise FileNotFoundError('No completed model run reports were found.')
 
@@ -295,7 +295,7 @@ def main() -> None:
         reports, _preserved_dacon_metrics(results_path)
     )
     history = _history_frame(reports)
-    monthly = _monthly_frame(root)
+    monthly = _monthly_frame(runs_dir)
     results.to_csv(results_path, index=False, encoding='utf-8')
     groups.to_csv(output / 'group_metrics.csv', index=False, encoding='utf-8')
     training.to_csv(output / 'training_summary.csv', index=False, encoding='utf-8')
@@ -315,7 +315,7 @@ def main() -> None:
         if not history.empty else '\n\n'
     )
     (output / 'RESULTS.md').write_text(
-        '# Baseline results\n\n'
+        '# Version 2 results\n\n'
         + _markdown_table(results)
         + '\n\n![Validation score](figures/score_comparison.png)\n\n'
         + '![DACON components](figures/dacon_components.png)\n\n'

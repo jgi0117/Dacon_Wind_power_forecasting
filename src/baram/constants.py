@@ -4,5 +4,5 @@ SUPPORTED_MODEL_NAMES = (
     'lightgbm', 'catboost', 'tabm', 'realmlp', 'xrfm',
 )
 DEFAULT_MODEL_NAMES = ('lightgbm', 'catboost')
-ITERATION_MODEL_NAMES = ('lightgbm', 'catboost')
-EPOCH_MODEL_NAMES = ('tabm', 'realmlp', 'xrfm')
+ITERATION_MODEL_NAMES: tuple[str, ...] = ()
+EPOCH_MODEL_NAMES = SUPPORTED_MODEL_NAMES

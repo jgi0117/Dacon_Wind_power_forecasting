@@ -1,10 +1,12 @@
-# DACON 풍력 발전량 예측
+# DACON 풍력 발전량 예측 — Version 2
 
-이 문서는 baseline 의사결정 단계인 **Version 1**을 설명합니다. 프로젝트 개요와 전처리 규약은 이후 버전에서도 공통으로 유지하고, 모델 선택 후의 학습·앙상블 전략은 3절부터 버전별로 갱신합니다.
+기상 예보 기반 풍력 발전량 예측 파이프라인입니다. Version 1의 5개 baseline 비교 결과에서 모델별 1-NMAE 차이보다 FICR 차이가 최종 점수를 더 크게 좌우한다는 가설을 얻었습니다. Version 2는 동일한 데이터와 검증 구간에서 FICR을 직접 반영하는 학습 전략을 검증합니다.
+
+Version 1 코드는 Git tag [v1.0.0](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v1.0.0)에 보존되어 있습니다.
 
 ## 1. 프로젝트 개요
 
-기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개(kpx_group_1~3)를 예측하는 회귀 프로젝트입니다. 현재 단계의 목적은 동일한 전처리와 시간 순 검증 조건에서 다음 5개 baseline을 비교해 후속 전략의 기준 모델을 정하는 것입니다.
+기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개 그룹(kpx_group_1~3)을 예측하는 회귀 프로젝트입니다. 다음 5개 모델을 동일한 전처리, 시간 분할, 최대 20단계 학습 조건에서 비교합니다.
 
 - LightGBM
 - CatBoost
@@ -12,7 +14,9 @@
 - RealMLP
 - xRFM
 
-모델별 검증 결과와 제출 파일은 독립적으로 생성하며, 비교용 지표는 [reports/baseline](reports/baseline)에 한 번 더 통합합니다. DACON 공개 점수와 구성 지표도 동일한 결과 파일에 보존합니다.
+평가식은 다음과 같습니다.
+
+    score = 0.5 × (1-NMAE) + 0.5 × FICR
 
 ## 2. 데이터 전처리 방식
 
@@ -27,36 +31,62 @@
 - 결측 처리: 동일한 예보 배치와 격자 안에서만 보간하고, 남은 값은 학습 구간 격자 중앙값으로 채우며 결측 표시 특성을 유지
 - 타깃: 발전량을 설비용량으로 나눈 capacity factor로 학습하고 예측 후 원 단위로 복원
 
-미래 정보 누수를 막기 위해 예보 생성 시각과 사용 가능 시각을 엄격하게 제한합니다. 원본 데이터와 생성 artifact는 각각 data/, artifacts/에 두며 두 디렉터리는 .gitignore에 포함됩니다.
+미래 정보 누수를 막기 위해 예보 생성 시각과 사용 가능 시각을 엄격하게 제한합니다. 원본 데이터와 생성 artifact는 각각 data/, artifacts/에 두며 Git 추적에서 제외합니다.
 
     .\.venv313\Scripts\python.exe preprocessing.py --data-dir data --output-dir artifacts --mode hybrid
 
-## 3. Baseline 학습 전략
+## 3. Version 2 학습 전략
 
-무작위 분할 대신 실제 예측 순서를 반영한 시간 순 검증을 사용합니다.
+### 시간 순 검증
 
 1. 2023-12-31 14:00 이전 데이터를 모델 학습에 사용합니다.
 2. 경계에서 11시간을 purge합니다.
-3. 2024년 1~3월 구간의 대회 score로 epoch 또는 iteration을 선택합니다.
-4. 2024년 7~12월은 baseline 간 최종 비교 전까지 건드리지 않습니다.
-5. 선택한 학습 길이로 각 타깃의 사용 가능한 전체 학습 데이터를 다시 학습해 테스트를 예측합니다.
+3. 2024년 1~3월을 학습 단계 선택용 validation으로 사용합니다.
+4. 2024년 7~12월은 모델 간 최종 비교 구간으로 유지합니다.
+5. 선택한 단계 수로 각 타깃의 사용 가능한 전체 과거 데이터를 다시 학습해 테스트를 예측합니다.
 
-세 타깃은 발전 단지별 관계와 유효 행 수가 다르므로 각각 독립적으로 학습합니다. 선택 지표는 0.5 × (1-NMAE) + 0.5 × FICR이며 높을수록 좋습니다. LightGBM과 CatBoost의 최적화 loss는 MAE, TabM은 MSE, RealMLP는 MAE, xRFM은 kernel-ridge 내부 목적함수입니다. 신경망 모델은 최대 20 epoch, xRFM은 최대 8 iteration을 사용합니다.
+세 타깃은 각각 독립적으로 학습합니다. 모든 모델은 조기 종료로 실행 길이를 줄이지 않고 최대 20 epoch 또는 round를 수행한 뒤 validation loss가 가장 좋은 단계를 최종 재학습 길이로 사용합니다.
 
-환경 구성과 전체 baseline 실행:
+### FICR-aware loss
+
+원래 FICR은 capacity-factor 절대오차가 6%와 8% 이내인지에 따라 보상이 계단식으로 바뀌므로 직접 미분할 수 없습니다. Version 2에서는 두 경계를 sigmoid로 근사한 soft-FICR을 사용합니다.
+
+    loss = 0.25 × smooth-MAE + 0.75 × (1-soft-FICR)
+
+기본 FICR 비중은 0.75, sigmoid temperature는 0.01입니다. 명령행의 --ficr-weight와 --ficr-temperature로 변경할 수 있습니다. 실제 competition score도 각 단계마다 함께 기록하지만 모델 선택에는 FICR-aware validation loss를 사용합니다.
+
+| 모델 | FICR 반영 방식 | 기록되는 history |
+|---|---|---|
+| LightGBM | custom gradient/Hessian objective | round별 train loss, validation loss, score |
+| CatBoost | custom objective/evaluation metric | round별 train loss, validation loss, score |
+| TabM | PyTorch FICR-aware loss | epoch별 train loss, validation loss, score |
+| RealMLP | PyTabKit custom train/validation metric | epoch별 train loss, validation loss, score |
+| xRFM | kernel-ridge 학습 유지, FICR-aware 모델 선택 | iteration별 평균 leaf validation loss와 score |
+
+xRFM의 내부 predictor는 kernel-ridge 방식이므로 외부 custom loss로 교체할 수 없습니다. 따라서 xRFM만 실제 학습 objective는 MSE 계열로 유지되며 FICR-aware loss는 iteration 선택에 반영됩니다. 또한 라이브러리가 leaf별 train loss를 노출하지 않아 xRFM의 train loss는 비어 있습니다.
+
+## 4. 실행 방법과 산출물
+
+환경을 구성한 뒤 전체 모델을 순차 실행합니다.
 
     .\scripts\setup_env.ps1
     .\scripts\run_models.ps1 -Models lightgbm,catboost,tabm,realmlp,xrfm -Device cpu
 
-일부 모델만 순서대로 실행할 수도 있습니다.
+FICR 비중이나 temperature를 변경하는 예:
 
-    .\scripts\run_models.ps1 -Models tabm,realmlp,xrfm -Device cpu
+    .\scripts\run_models.ps1 -Models tabm,realmlp -Device cpu -PipelineArgs --ficr-weight 0.8 --ficr-temperature 0.008
 
-실행이 끝나면 평가 결과가 자동 통합됩니다. 기존 결과만 다시 모으려면 다음 명령을 사용합니다.
+V2 모델별 원본 산출물은 model_outputs/v2/runs/모델명에 저장됩니다. 실행이 끝나면 reports/v2에 다음 파일이 자동 생성됩니다.
 
-    .\.venv313\Scripts\python.exe scripts\build_report.py
+- results.csv: 모델별 validation 및 DACON 지표
+- group_metrics.csv: 모델·타깃별 지표
+- monthly_metrics.csv: 월별 지표
+- training_summary.csv: 최적 단계와 학습 시간
+- training_history.csv: 모델·타깃·epoch/round별 loss와 score
+- figures/training_curves.png: 모델별 train/validation loss 변화
+- figures/score_comparison.png: 최종 validation score 비교
 
-## 4. Baseline 평가 결과
+## 5. Version 1 baseline 결과
 
 | 검증 순위 | 모델 | 검증 score | DACON score | DACON 1-NMAE | DACON FICR |
 |---:|---|---:|---:|---:|---:|
@@ -66,19 +96,8 @@
 | 4 | CatBoost | 0.612603 | 0.621374 | 0.869805 | 0.372943 |
 | 5 | xRFM | 0.598697 | 0.614580 | 0.870831 | 0.358329 |
 
-![Baseline 최종 score 비교](reports/baseline/figures/score_comparison.png)
+![Version 1 score 비교](reports/baseline/figures/score_comparison.png)
 
-![DACON 1-NMAE와 FICR 비교](reports/baseline/figures/dacon_components.png)
+![Version 1 DACON 구성 지표](reports/baseline/figures/dacon_components.png)
 
-### 결과 해석과 Version 2 가설
-
-DACON score의 모델 간 범위는 0.01128로 작습니다. 특히 1-NMAE 범위는 0.00223에 불과하지만 FICR 범위는 0.02459이며, 이 5개 결과 안에서는 최종 score와 FICR의 상관계수가 0.999입니다. 표본이 모델 5개뿐이므로 일반화할 수는 없지만, 현재 모델 순위가 사실상 FICR 차이로 결정된다는 근거는 충분합니다.
-
-Version 2에서는 FICR을 더 강하게 반영하되, 계단형인 원래 FICR 자체를 직접 loss로 사용하지 않습니다. 절대오차 6%와 8% 경계를 sigmoid로 근사한 differentiable soft-FICR과 MAE를 결합하고, FICR 비중을 높이는 실험을 우선합니다. 순수 FICR은 경계 밖의 오차 크기를 구분하지 않고 거의 모든 구간에서 gradient가 0이라 학습이 멈추거나 불안정해질 수 있습니다.
-
-통합 산출물:
-
-- [results.csv](reports/baseline/results.csv): 모델별 최종 지표와 DACON 점수 입력 열
-- [group_metrics.csv](reports/baseline/group_metrics.csv): 모델·타깃별 지표
-- [monthly_metrics.csv](reports/baseline/monthly_metrics.csv): 월별 지표
-- [training_summary.csv](reports/baseline/training_summary.csv): 타깃별 최적 학습 길이와 소요 시간
+DACON score의 모델 간 범위는 0.01128입니다. 1-NMAE 범위는 0.00223인 반면 FICR 범위는 0.02459였으며, 이 5개 결과 안에서 최종 score와 FICR의 상관계수는 0.999였습니다. 표본 수가 작으므로 Version 2에서는 soft-FICR 학습이 실제 비교 구간과 DACON 점수를 함께 개선하는지 대조해야 합니다.

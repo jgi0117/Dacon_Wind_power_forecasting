@@ -35,7 +35,9 @@ class PipelineConfig:
     early_stopping_min_delta: float = 1e-5
     batch_size: int = 256
     learning_rate: float = 1e-4
-    xrfm_iterations: int = 8
+    ficr_weight: float = 0.75
+    ficr_temperature: float = 0.01
+    xrfm_iterations: int = 20
     xrfm_max_leaf_samples: int = 2000
     xrfm_m_batch_size: int = 64
     device: str | None = None
@@ -70,7 +72,9 @@ def parse_args() -> PipelineConfig:
     parser.add_argument('--early-stopping-min-delta', type=float, default=1e-5)
     parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--learning-rate', type=float, default=1e-4)
-    parser.add_argument('--xrfm-iterations', type=int, default=8)
+    parser.add_argument('--ficr-weight', type=float, default=0.75)
+    parser.add_argument('--ficr-temperature', type=float, default=0.01)
+    parser.add_argument('--xrfm-iterations', type=int, default=20)
     parser.add_argument('--xrfm-max-leaf-samples', type=int, default=2000)
     parser.add_argument('--xrfm-m-batch-size', type=int, default=64)
     parser.add_argument('--device', default=None, help='cpu, cuda, or omit for auto')
@@ -88,6 +92,10 @@ def parse_args() -> PipelineConfig:
         parser.error('--early-stopping-min-delta must be non-negative.')
     if values['learning_rate'] <= 0.0:
         parser.error('--learning-rate must be positive.')
+    if not 0.0 <= values['ficr_weight'] <= 1.0:
+        parser.error('--ficr-weight must be between 0 and 1.')
+    if values['ficr_temperature'] <= 0.0:
+        parser.error('--ficr-temperature must be positive.')
     requested_models = values.pop('models')
     if requested_models is None:
         models = DEFAULT_MODEL_NAMES

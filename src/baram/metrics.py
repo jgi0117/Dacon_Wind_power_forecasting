@@ -87,6 +87,107 @@ def target_score(actual: np.ndarray, prediction: np.ndarray) -> float:
     return 0.5 * (1.0 - nmae) + 0.5 * ficr
 
 
+def ficr_aware_loss(
+    actual: np.ndarray,
+    prediction: np.ndarray,
+    *,
+    ficr_weight: float = 0.75,
+    temperature: float = 0.01,
+) -> float:
+    '''Differentiable-style NumPy surrogate for the discontinuous FICR metric.'''
+    actual = np.asarray(actual, dtype=float).reshape(-1)
+    prediction = np.asarray(prediction, dtype=float).reshape(-1)
+    valid = np.isfinite(actual) & np.isfinite(prediction) & (actual >= 0.10)
+    if not valid.any():
+        raise ValueError('No rows are eligible for the FICR-aware loss.')
+    actual = actual[valid]
+    error = np.sqrt((prediction[valid] - actual) ** 2 + 1e-8)
+    sigmoid_6 = 1.0 / (1.0 + np.exp(np.clip((error - 0.06) / temperature, -60, 60)))
+    sigmoid_8 = 1.0 / (1.0 + np.exp(np.clip((error - 0.08) / temperature, -60, 60)))
+    normalized_weight = actual / max(float(actual.mean()), 1e-12)
+    soft_ficr = float(np.mean(normalized_weight * (3.0 * sigmoid_8 + sigmoid_6) / 4.0))
+    mae = float(error.mean())
+    return (1.0 - ficr_weight) * mae + ficr_weight * (1.0 - soft_ficr)
+
+
+def ficr_aware_grad_hess(
+    actual: np.ndarray,
+    prediction: np.ndarray,
+    *,
+    ficr_weight: float = 0.75,
+    temperature: float = 0.01,
+) -> tuple[np.ndarray, np.ndarray]:
+    '''Gradient and positive Hessian approximation for boosting objectives.'''
+    actual = np.asarray(actual, dtype=float)
+    prediction = np.asarray(prediction, dtype=float)
+    valid = np.isfinite(actual) & np.isfinite(prediction) & (actual >= 0.10)
+    delta = prediction - actual
+    smooth_abs = np.sqrt(delta * delta + 1e-8)
+    first_abs = delta / smooth_abs
+    second_abs = 1e-8 / np.maximum(smooth_abs ** 3, 1e-12)
+    mean_actual = max(float(actual[valid].mean()) if valid.any() else 1.0, 1e-12)
+    sample_weight = np.where(valid, actual / mean_actual, 0.0)
+
+    def gate(threshold: float) -> tuple[np.ndarray, np.ndarray]:
+        value = 1.0 / (
+            1.0 + np.exp(np.clip((smooth_abs - threshold) / temperature, -60, 60))
+        )
+        first = -value * (1.0 - value) / temperature
+        second = value * (1.0 - value) * (1.0 - 2.0 * value) / temperature**2
+        return first, second
+
+    first_6, second_6 = gate(0.06)
+    first_8, second_8 = gate(0.08)
+    reward_scale = ficr_weight * sample_weight / 4.0
+    loss_first_abs = (
+        (1.0 - ficr_weight)
+        - reward_scale * (3.0 * first_8 + first_6)
+    )
+    loss_second_abs = -reward_scale * (3.0 * second_8 + second_6)
+    gradient = loss_first_abs * first_abs
+    hessian = loss_second_abs * first_abs**2 + loss_first_abs * second_abs
+    gradient = np.where(valid, gradient, 0.0)
+    # Boosting libraries require enough positive curvature to form leaves.
+    # The exact surrogate is non-convex near its two thresholds, so use a
+    # conservative positive approximation rather than exposing negative Hessians.
+    hessian = np.where(valid, np.maximum(hessian, 1e-3), 1e-3)
+    return gradient, hessian
+
+
+def ficr_aware_loss_torch(
+    actual: Any,
+    prediction: Any,
+    *,
+    ficr_weight: float = 0.75,
+    temperature: float = 0.01,
+) -> Any:
+    '''PyTorch soft-FICR surrogate reduced across the final sample dimension.'''
+    import torch
+
+    actual = actual.squeeze(-1)
+    prediction = prediction.squeeze(-1)
+    if actual.ndim < prediction.ndim:
+        actual = actual.unsqueeze(0).expand_as(prediction)
+    elif prediction.ndim < actual.ndim:
+        prediction = prediction.unsqueeze(0).expand_as(actual)
+    if actual.shape != prediction.shape:
+        actual = torch.broadcast_to(actual, prediction.shape)
+    valid = torch.isfinite(actual) & torch.isfinite(prediction) & (actual >= 0.10)
+    smooth_error = torch.sqrt((prediction - actual).square() + 1e-8)
+    valid_float = valid.to(smooth_error.dtype)
+    count = valid_float.sum(dim=-1).clamp_min(1.0)
+    mae = (smooth_error * valid_float).sum(dim=-1) / count
+    mean_actual = (
+        (actual * valid_float).sum(dim=-1) / count
+    ).clamp_min(1e-12)
+    normalized_weight = actual / mean_actual.unsqueeze(-1)
+    sigmoid_6 = torch.sigmoid((0.06 - smooth_error) / temperature)
+    sigmoid_8 = torch.sigmoid((0.08 - smooth_error) / temperature)
+    soft_reward = normalized_weight * (3.0 * sigmoid_8 + sigmoid_6) / 4.0
+    soft_ficr = (soft_reward * valid_float).sum(dim=-1) / count
+    return (1.0 - ficr_weight) * mae + ficr_weight * (1.0 - soft_ficr)
+
+
 def metric_report(answer: pd.DataFrame, prediction: pd.DataFrame) -> dict[str, Any]:
     _validate_frames(answer, prediction)
     groups: dict[str, dict[str, float | int]] = {}

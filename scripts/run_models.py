@@ -48,7 +48,10 @@ def parse_args() -> argparse.Namespace:
         help='Model names, or all.',
     )
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
-    parser.add_argument('--runs-dir', type=Path, default=Path('model_outputs/runs'))
+    parser.add_argument(
+        '--runs-dir', type=Path, default=Path('model_outputs/v2/runs')
+    )
+    parser.add_argument('--report-dir', type=Path, default=Path('reports/v2'))
     parser.add_argument('--reuse-completed', action='store_true')
     parser.add_argument('--evaluation-only', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
@@ -98,7 +101,11 @@ def main() -> None:
         if not args.dry_run:
             subprocess.run(command, check=True)
 
-    report_command = [str(interpreter), str(repo_root / 'scripts' / 'build_report.py')]
+    report_command = [
+        str(interpreter), str(repo_root / 'scripts' / 'build_report.py'),
+        '--runs-dir', str(runs_dir),
+        '--output-dir', str((repo_root / args.report_dir).resolve()),
+    ]
     print('> ' + subprocess.list2cmdline(report_command), flush=True)
     if not args.dry_run:
         subprocess.run(report_command, check=True)

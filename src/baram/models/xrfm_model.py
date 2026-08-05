@@ -12,7 +12,7 @@ import pandas as pd
 from sklearn.impute import SimpleImputer
 
 from baram.config import PipelineConfig
-from baram.metrics import target_score
+from baram.metrics import ficr_aware_loss, target_score
 from .base import RegressionModel
 
 
@@ -31,6 +31,8 @@ class XRFMModel(RegressionModel):
         self.has_temporal_validation = False
         self.n_threads = 1
         self.metric_fallback_count = 0
+        self.training_history: list[dict[str, float | int | None]] = []
+        self.metric_trace: list[tuple[float, float]] = []
 
     def _transform(self, X: pd.DataFrame, *, fit: bool = False) -> pd.DataFrame:
         values = (
@@ -75,10 +77,10 @@ class XRFMModel(RegressionModel):
         configured_iterations = self.iterations
         owner = self
 
-        class CompetitionScoreMetric(Metric):
+        class FICRAwareSelectionMetric(Metric):
             name = 'mse'
-            display_name = 'competition score'
-            should_maximize = True
+            display_name = 'FICR-aware loss'
+            should_maximize = False
             task_types = ['reg']
             required_quantities = ['y_true_reg', 'y_pred']
 
@@ -94,12 +96,20 @@ class XRFMModel(RegressionModel):
                     owner.metric_fallback_count += 1
                     finite = np.isfinite(actual) & np.isfinite(prediction)
                     if not finite.any():
-                        return float('-inf')
+                        return float('inf')
                     error = np.abs(
                         np.clip(prediction[finite], 0.0, 1.0) - actual[finite]
                     )
-                    return 1.0 - float(error.mean())
-                return target_score(actual, prediction)
+                    return float(error.mean())
+                loss = ficr_aware_loss(
+                    actual, prediction,
+                    ficr_weight=owner.config.ficr_weight,
+                    temperature=owner.config.ficr_temperature,
+                )
+                owner.metric_trace.append(
+                    (loss, target_score(actual, prediction))
+                )
+                return loss
 
         class ConfigurableXRFMRegressor(XRFM_D_Regressor):
             def _create_alg_interface(self, n_cv: int) -> Any:
@@ -113,7 +123,7 @@ class XRFMModel(RegressionModel):
 
         def score_aware_metric(name: str) -> Metric:
             if name == 'mse':
-                return CompetitionScoreMetric()
+                return FICRAwareSelectionMetric()
             return original_from_name(name)
 
         Metric.from_name = staticmethod(score_aware_metric)
@@ -124,7 +134,7 @@ class XRFMModel(RegressionModel):
             reg=1e-3, iters=self.iterations, diag=True,
             bandwidth_mode='constant', kernel_type='l2',
             max_leaf_samples=self.config.xrfm_max_leaf_samples,
-            val_metric_name='mse', early_stop_rfm=has_validation,
+            val_metric_name='mse', early_stop_rfm=False,
             early_stop_multiplier=1.01,
             M_batch_size=self.config.xrfm_m_batch_size,
             verbosity=2,
@@ -141,6 +151,25 @@ class XRFMModel(RegressionModel):
         finally:
             Metric.from_name = staticmethod(original_from_name)
         self.leaf_best_iterations = self._leaf_best_iterations()
+        chunk_size = self.iterations + 1
+        chunks = [
+            self.metric_trace[start:start + chunk_size]
+            for start in range(0, len(self.metric_trace), chunk_size)
+            if len(self.metric_trace[start:start + chunk_size]) >= self.iterations
+        ]
+        self.training_history = [
+            {
+                'step': step,
+                'train_loss': None,
+                'validation_loss': float(np.mean([
+                    chunk[step - 1][0] for chunk in chunks
+                ])),
+                'validation_score': float(np.mean([
+                    chunk[step - 1][1] for chunk in chunks
+                ])),
+            }
+            for step in range(1, self.iterations + 1)
+        ] if chunks else []
         if has_validation and self.leaf_best_iterations:
             self.best_iteration = max(
                 1, int(round(float(np.median(self.leaf_best_iterations))))
@@ -197,11 +226,14 @@ class XRFMModel(RegressionModel):
             'max_iterations': self.iterations,
             'best_iteration': self.best_iteration,
             'leaf_best_iterations': getattr(self, 'leaf_best_iterations', []),
-            'validation_metric': 'competition-score',
-            'loss_name': 'kernel-ridge-objective',
-            'selection_metric': 'competition-score',
-            'training_history': [],
-            'empty_ficr_leaf_metric': 'one-minus-mae',
+            'validation_metric': 'ficr-aware-loss',
+            'loss_name': 'kernel-ridge-mse',
+            'selection_metric': 'ficr-aware-loss',
+            'training_history': self.training_history,
+            'history_scope': 'mean-leaf-validation; train-loss-unavailable',
+            'ficr_weight': self.config.ficr_weight,
+            'ficr_temperature': self.config.ficr_temperature,
+            'empty_ficr_leaf_metric': 'mae',
             'metric_fallback_count': self.metric_fallback_count,
             'temporal_validation': self.has_temporal_validation,
             'max_leaf_samples': self.config.xrfm_max_leaf_samples,

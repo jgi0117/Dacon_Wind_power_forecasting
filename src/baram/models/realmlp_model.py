@@ -11,11 +11,13 @@ import numpy as np
 import pandas as pd
 
 from baram.config import PipelineConfig
+from baram.metrics import ficr_aware_loss_torch
 from .base import RegressionModel
 
 
 LOGGER = logging.getLogger('baram.pipeline')
-_SCORE_LOSS = 'baram_score_loss'
+_TRAIN_FICR_LOSS = 'baram_train_ficr_aware_loss'
+_VAL_FICR_LOSS = 'baram_val_ficr_aware_loss'
 
 
 def _competition_score_loss(y_pred: Any, y: Any) -> Any:
@@ -63,17 +65,32 @@ class RealMLPModel(RegressionModel):
             else self.config.n_jobs
         )
         original_apply = Metrics.apply
+        epoch_train_losses: list[float] = []
 
         def score_aware_apply(y_pred: Any, actual: Any, metric_name: str) -> Any:
-            if metric_name == _SCORE_LOSS:
-                value = _competition_score_loss(y_pred, actual)
-                mean_value = float(value.detach().mean().cpu())
+            if metric_name in {_TRAIN_FICR_LOSS, _VAL_FICR_LOSS}:
+                value = ficr_aware_loss_torch(
+                    actual, y_pred,
+                    ficr_weight=self.config.ficr_weight,
+                    temperature=self.config.ficr_temperature,
+                )
+                mean_loss = float(value.detach().mean().cpu())
+                if metric_name == _TRAIN_FICR_LOSS:
+                    epoch_train_losses.append(mean_loss)
+                    return value
+                score_value = _competition_score_loss(y_pred, actual)
                 self.training_history.append({
                     'step': len(self.training_history) + 1,
-                    'train_loss': None,
-                    'validation_loss': mean_value,
-                    'validation_score': -mean_value,
+                    'train_loss': (
+                        float(np.mean(epoch_train_losses))
+                        if epoch_train_losses else None
+                    ),
+                    'validation_loss': mean_loss,
+                    'validation_score': -float(
+                        score_value.detach().mean().cpu()
+                    ),
                 })
+                epoch_train_losses.clear()
                 return value
             return original_apply(y_pred, actual, metric_name)
 
@@ -90,9 +107,10 @@ class RealMLPModel(RegressionModel):
             n_threads=self.n_threads, n_epochs=self.epochs,
             batch_size=self.config.batch_size, n_cv=1, n_refit=0,
             n_ens=8, normalize_output=False,
-            train_metric_name='mae', val_metric_name=_SCORE_LOSS,
+            train_metric_name=_TRAIN_FICR_LOSS,
+            val_metric_name=_VAL_FICR_LOSS,
             use_early_stopping=has_validation,
-            early_stopping_additive_patience=self.config.early_stopping_patience,
+            early_stopping_additive_patience=self.epochs,
             early_stopping_multiplicative_patience=1.0,
             stop_epoch=None if has_validation else self.epochs,
             verbosity=2,
@@ -119,7 +137,7 @@ class RealMLPModel(RegressionModel):
             if isinstance(candidate, dict):
                 value = candidate.get('stop_epoch', candidate.get('best_epoch'))
                 if isinstance(value, dict):
-                    value = value.get(_SCORE_LOSS)
+                    value = value.get(_VAL_FICR_LOSS)
                 if value is not None:
                     return max(1, int(value))
         return self.epochs
@@ -133,8 +151,10 @@ class RealMLPModel(RegressionModel):
         return {
             'model': 'RealMLP-TD', 'training': 'supervised-gradient',
             'max_epochs': self.epochs, 'best_iteration': self.best_iteration,
-            'validation_metric': 'competition-score', 'n_ens': 8,
-            'loss_name': 'mae', 'selection_metric': 'competition-score',
+            'validation_metric': 'ficr-aware-loss', 'n_ens': 8,
+            'loss_name': 'ficr-aware', 'selection_metric': 'ficr-aware-loss',
+            'ficr_weight': self.config.ficr_weight,
+            'ficr_temperature': self.config.ficr_temperature,
             'training_history': self.training_history,
             'device': self.device, 'n_threads': self.n_threads,
             'elapsed_seconds': self.elapsed_seconds,

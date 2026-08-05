@@ -13,7 +13,9 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 
 from baram.config import PipelineConfig
-from baram.metrics import target_score
+from baram.metrics import (
+    ficr_aware_loss, ficr_aware_loss_torch, target_score,
+)
 from .base import RegressionModel
 
 
@@ -26,6 +28,7 @@ class TabMModel(RegressionModel):
         self.epochs = int(epochs or config.max_epochs)
         self.best_iteration = self.epochs
         self.best_score: float | None = None
+        self.best_validation_loss: float | None = None
         self.model: Any | None = None
         self.imputer = SimpleImputer(strategy='median')
         self.scaler = StandardScaler()
@@ -76,7 +79,6 @@ class TabMModel(RegressionModel):
             generator=generator,
         )
         best_state = None
-        wait = 0
         for epoch in range(1, self.epochs + 1):
             self.model.train()
             train_loss_sum = 0.0
@@ -85,7 +87,12 @@ class TabMModel(RegressionModel):
                 features, target = features.to(device), target.to(device)
                 optimizer.zero_grad(set_to_none=True)
                 prediction = self.model(features).squeeze(-1)
-                loss = ((prediction - target[:, None]) ** 2).mean()
+                loss = ficr_aware_loss_torch(
+                    target,
+                    prediction.transpose(0, 1),
+                    ficr_weight=self.config.ficr_weight,
+                    temperature=self.config.ficr_temperature,
+                ).mean()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
@@ -94,7 +101,11 @@ class TabMModel(RegressionModel):
             if X_val is None or y_val is None:
                 continue
             prediction = self._predict_array(X_val)
-            validation_loss = float(np.mean((prediction - y_val) ** 2))
+            validation_loss = ficr_aware_loss(
+                y_val, prediction,
+                ficr_weight=self.config.ficr_weight,
+                temperature=self.config.ficr_temperature,
+            )
             score = target_score(y_val, prediction)
             self.training_history.append({
                 'step': epoch,
@@ -103,13 +114,14 @@ class TabMModel(RegressionModel):
                 'validation_score': score,
             })
             LOGGER.info('TabM epoch=%d score=%.7f', epoch, score)
-            if self.best_score is None or score > self.best_score + self.config.early_stopping_min_delta:
-                self.best_score, self.best_iteration, wait = score, epoch, 0
+            if (
+                self.best_validation_loss is None
+                or validation_loss
+                < self.best_validation_loss - self.config.early_stopping_min_delta
+            ):
+                self.best_validation_loss = validation_loss
+                self.best_score, self.best_iteration = score, epoch
                 best_state = copy.deepcopy(self.model.state_dict())
-            else:
-                wait += 1
-                if wait >= self.config.early_stopping_patience:
-                    break
         if best_state is not None:
             self.model.load_state_dict(best_state)
         self.model.eval()
@@ -135,7 +147,10 @@ class TabMModel(RegressionModel):
             'model': 'TabM', 'training': 'supervised-gradient',
             'max_epochs': self.epochs, 'best_iteration': self.best_iteration,
             'best_validation_score': self.best_score, 'ensemble_size': 32,
-            'loss_name': 'mse', 'selection_metric': 'competition-score',
+            'best_validation_loss': self.best_validation_loss,
+            'loss_name': 'ficr-aware', 'selection_metric': 'ficr-aware-loss',
+            'ficr_weight': self.config.ficr_weight,
+            'ficr_temperature': self.config.ficr_temperature,
             'training_history': self.training_history,
             'device': self.device, 'elapsed_seconds': self.elapsed_seconds,
         }

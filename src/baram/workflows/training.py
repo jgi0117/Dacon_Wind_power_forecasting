@@ -358,7 +358,7 @@ def run_pipeline(config: PipelineConfig) -> pd.DataFrame:
         'early_stopping_window': {
             'start': X_validation.index[early_stopping_mask].min(),
             'end': X_validation.index[early_stopping_mask].max(),
-            'metric': 'competition-score',
+            'metric': 'ficr-aware-loss',
         },
         "config": asdict(config),
         "split": {
