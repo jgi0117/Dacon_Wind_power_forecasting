@@ -1,12 +1,12 @@
 # DACON 풍력 발전량 예측 — Version 2
 
-기상 예보 기반 풍력 발전량 예측 파이프라인입니다. Version 1의 5개 baseline 비교 결과에서 모델별 1-NMAE 차이보다 FICR 차이가 최종 점수를 더 크게 좌우한다는 가설을 얻었습니다. Version 2는 동일한 데이터와 검증 구간에서 FICR을 직접 반영하는 학습 전략을 검증합니다.
+기상 예보 기반 풍력 발전량 예측 파이프라인입니다. Version 1의 5개 baseline 비교 결과에서 모델별 1-NMAE 차이보다 FICR 차이가 최종 점수를 더 크게 좌우한다는 가설을 얻었습니다. Version 2의 20-epoch 실험 결과 RealMLP을 최종 baseline으로 선정했으며, 현재 200 epoch로 학습 길이를 확장해 검증합니다.
 
 Version 1 코드는 Git tag [v1.0.0](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v1.0.0)에 보존되어 있습니다.
 
 ## 1. 프로젝트 개요
 
-기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개 그룹(kpx_group_1~3)을 예측하는 회귀 프로젝트입니다. Version 2에서는 다음 4개 모델을 동일한 전처리, 시간 분할, 학습 조건에서 비교합니다.
+기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개 그룹(kpx_group_1~3)을 예측하는 회귀 프로젝트입니다. Version 2에서는 다음 4개 모델을 동일 조건으로 비교한 뒤 RealMLP을 기준 모델로 결정했습니다.
 
 - LightGBM
 - CatBoost
@@ -63,10 +63,10 @@ Version 1 코드는 Git tag [v1.0.0](https://github.com/jgi0117/Dacon_Wind_power
 
 ## 4. 실행 방법과 산출물
 
-환경을 구성한 뒤 전체 모델을 순차 실행합니다.
+환경을 구성한 뒤 선정된 RealMLP을 200 epoch로 실행합니다.
 
     .\scripts\setup_env.ps1
-    .\scripts\run_models.ps1 -Models lightgbm,catboost,tabm,realmlp -Device cpu
+    .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs --max-epochs 200
 
 FICR 비중이나 temperature를 변경하는 예:
 
@@ -79,10 +79,32 @@ V2 모델별 원본 산출물은 model_outputs/v2/runs/모델명에 저장됩니
 - monthly_metrics.csv: 월별 지표
 - training_summary.csv: 최적 단계와 학습 시간
 - training_history.csv: 모델·타깃·epoch/round별 loss와 score
-- figures/training_curves.png: 모델별 train/validation loss 변화
+- figures/training_curves.png: RealMLP 200-epoch train/validation loss 변화
 - figures/score_comparison.png: 최종 validation score 비교
 
-## 5. Version 1 baseline 결과
+## 5. Version 2 모델 선정 결과
+
+| 모델 | 20-epoch validation score | DACON score | DACON 1-NMAE | DACON FICR | 판단 |
+|---|---:|---:|---:|---:|---|
+| RealMLP | 0.651523 | 0.630536 | 0.856565 | 0.404507 | 최종 baseline 선정 |
+| TabM | 0.646692 | 0.621621 | 0.867165 | 0.376078 | 성능 개선 확인 |
+| LightGBM | 0.431687 | 미제출 | - | - | 내부 검증 부진 |
+| CatBoost | 0.417204 | 미제출 | - | - | 내부 검증 부진 |
+
+LightGBM과 CatBoost는 train/validation 결과가 baseline보다 크게 낮아 DACON에 제출하지 않았습니다. TabM과 RealMLP은 모두 Version 1보다 개선됐으며 RealMLP의 향상이 가장 분명했습니다.
+
+- RealMLP DACON score: 0.624299 → 0.630536, +0.006237
+- RealMLP FICR: 0.378593 → 0.404507, +0.025914
+- TabM DACON score: 0.613019 → 0.621621, +0.008602
+- TabM FICR: 0.353999 → 0.376078, +0.022079
+
+두 모델 모두 FICR은 개선됐지만 1-NMAE는 하락했습니다. 이는 FICR 비중을 높인 loss가 의도대로 동작했다는 신호인 동시에 MAE와의 trade-off가 존재한다는 뜻입니다. 최종 score, FICR 절대값, 모델 안정성을 함께 고려해 RealMLP을 baseline으로 선정했습니다.
+
+다음 실험은 RealMLP만 200 epoch까지 학습합니다. 200개 epoch를 모두 실행하되 FICR-aware validation loss가 가장 낮은 epoch를 최종 재학습 길이로 선택합니다. train/validation loss 그래프도 이 RealMLP 실행만 README와 reports/v2에 사용합니다.
+
+![RealMLP 200-epoch train/validation loss](reports/v2/figures/training_curves.png)
+
+## 6. Version 1 baseline 결과
 
 | 검증 순위 | 모델 | 검증 score | DACON score | DACON 1-NMAE | DACON FICR |
 |---:|---|---:|---:|---:|---:|

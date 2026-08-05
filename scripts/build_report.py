@@ -213,42 +213,30 @@ def _plot_dacon_components(results: pd.DataFrame, path: Path) -> None:
 
 
 def _plot_histories(history: pd.DataFrame, path: Path) -> None:
-    fig, axes = plt.subplots(3, 2, figsize=(13, 12))
+    fig, ax = plt.subplots(figsize=(10, 6))
     colors = dict(zip(TARGETS, ('#2878B5', '#E07B39', '#4E9F3D'), strict=True))
-    for ax, model in zip(axes.flat, MODELS, strict=False):
-        model_history = history.loc[history['model'] == model]
-        if model_history.empty:
-            ax.text(
-                0.5, 0.5,
-                'History was not recorded\nfor the existing legacy run.\nRe-run this model to populate.',
-                ha='center', va='center', transform=ax.transAxes,
+    model_history = history.loc[history['model'] == 'realmlp']
+    for target in TARGETS:
+        target_history = model_history.loc[model_history['target'] == target]
+        if target_history.empty:
+            continue
+        if target_history['train_loss'].notna().any():
+            ax.plot(
+                target_history['step'], target_history['train_loss'],
+                linestyle='--', color=colors[target], alpha=0.75,
+                label=f'{target} train',
             )
-            ax.set_xticks([])
-            ax.set_yticks([])
-        else:
-            for target in TARGETS:
-                target_history = model_history.loc[model_history['target'] == target]
-                if target_history.empty:
-                    continue
-                if target_history['train_loss'].notna().any():
-                    ax.plot(
-                        target_history['step'], target_history['train_loss'],
-                        linestyle='--', color=colors[target], alpha=0.75,
-                        label=f'{target} train',
-                    )
-                if target_history['validation_loss'].notna().any():
-                    ax.plot(
-                        target_history['step'], target_history['validation_loss'],
-                        color=colors[target], label=f'{target} validation',
-                    )
-            ax.set_xlabel('Epoch / iteration')
-            ax.set_ylabel('Recorded loss')
-            ax.grid(alpha=0.25)
-            ax.legend(fontsize=7, ncol=2)
-        ax.set_title(DISPLAY_NAMES[model])
-    axes.flat[-1].axis('off')
-    fig.suptitle('Train / validation history by model and target', fontsize=15)
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+        if target_history['validation_loss'].notna().any():
+            ax.plot(
+                target_history['step'], target_history['validation_loss'],
+                color=colors[target], label=f'{target} validation',
+            )
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('FICR-aware loss')
+    ax.set_title('RealMLP 200-epoch train / validation history')
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
 
@@ -299,18 +287,21 @@ def main() -> None:
     training.to_csv(output / 'training_summary.csv', index=False, encoding='utf-8')
     history_path = output / 'training_history.csv'
     history_figure = figures / 'training_curves.png'
+    realmlp_history = history.loc[history['model'] == 'realmlp']
     if history.empty:
         history_path.unlink(missing_ok=True)
-        history_figure.unlink(missing_ok=True)
     else:
         history.to_csv(history_path, index=False, encoding='utf-8')
-        _plot_histories(history, history_figure)
+    if realmlp_history.empty:
+        history_figure.unlink(missing_ok=True)
+    else:
+        _plot_histories(realmlp_history, history_figure)
     monthly.to_csv(output / 'monthly_metrics.csv', index=False, encoding='utf-8')
     _plot_scores(results, figures / 'score_comparison.png')
     _plot_dacon_components(results, figures / 'dacon_components.png')
     history_section = (
         '\n\n![Training curves](figures/training_curves.png)\n\n'
-        if not history.empty else '\n\n'
+        if not realmlp_history.empty else '\n\n'
     )
     (output / 'RESULTS.md').write_text(
         '# Version 2 results\n\n'
