@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-SUPPORTED_MODELS = ('realmlp', 'realmlp_adapter')
+SUPPORTED_MODELS = ('realmlp',)
 ALIASES = {'all': SUPPORTED_MODELS}
 
 
