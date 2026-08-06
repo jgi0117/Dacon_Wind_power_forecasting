@@ -11,13 +11,14 @@ import numpy as np
 import pandas as pd
 
 from baram.config import PipelineConfig
-from baram.metrics import TARGET_COLS, ficr_aware_loss_torch
+from baram.metrics import TARGET_COLS, activity_loss_torch, ficr_aware_loss_torch
 from .base import RegressionModel
 
 
 LOGGER = logging.getLogger('baram.pipeline')
 _TRAIN_FICR_LOSS = 'baram_train_ficr_aware_loss'
 _VAL_FICR_LOSS = 'baram_val_ficr_aware_loss'
+_MISSING_TARGET = -1.0
 _REALMLP_TD_REG_PARAMS = {
     'hidden_sizes': [256] * 3,
     'max_one_hot_cat_size': 9,
@@ -120,6 +121,8 @@ class RealMLPModel(RegressionModel):
         )
         original_apply = Metrics.apply
         epoch_train_losses: list[float] = []
+        epoch_objective_train_losses: list[float] = []
+        epoch_activity_train_losses: list[float] = []
         epoch_group_train_losses: dict[str, list[float]] = {}
         if isinstance(y, pd.DataFrame):
             self.target_names = [str(column) for column in y.columns]
@@ -129,17 +132,33 @@ class RealMLPModel(RegressionModel):
 
         def score_aware_apply(y_pred: Any, actual: Any, metric_name: str) -> Any:
             if metric_name in {_TRAIN_FICR_LOSS, _VAL_FICR_LOSS}:
-                value = ficr_aware_loss_torch(
-                    actual, y_pred,
+                n_targets = len(self.target_names)
+                actual_capacity = actual[..., :n_targets]
+                predicted_capacity = y_pred[..., :n_targets]
+                actual_activity = actual[..., n_targets:]
+                predicted_activity = y_pred[..., n_targets:]
+                capacity_loss = ficr_aware_loss_torch(
+                    actual_capacity, predicted_capacity,
                     ficr_weight=self.config.ficr_weight,
                     temperature=self.config.ficr_temperature,
                 )
+                activity_loss = activity_loss_torch(
+                    actual_activity, predicted_activity
+                )
+                value = (
+                    capacity_loss
+                    + self.config.activity_loss_weight * activity_loss
+                    if metric_name == _TRAIN_FICR_LOSS
+                    else capacity_loss
+                )
                 mean_loss = float(value.detach().mean().cpu())
+                mean_capacity_loss = float(capacity_loss.detach().mean().cpu())
+                mean_activity_loss = float(activity_loss.detach().mean().cpu())
                 group_losses = {
                     target: float(
                         ficr_aware_loss_torch(
-                            actual[..., index:index + 1],
-                            y_pred[..., index:index + 1],
+                            actual_capacity[..., index:index + 1],
+                            predicted_capacity[..., index:index + 1],
                             ficr_weight=self.config.ficr_weight,
                             temperature=self.config.ficr_temperature,
                         ).detach().mean().cpu()
@@ -147,11 +166,15 @@ class RealMLPModel(RegressionModel):
                     for index, target in enumerate(self.target_names)
                 }
                 if metric_name == _TRAIN_FICR_LOSS:
-                    epoch_train_losses.append(mean_loss)
+                    epoch_train_losses.append(mean_capacity_loss)
+                    epoch_objective_train_losses.append(mean_loss)
+                    epoch_activity_train_losses.append(mean_activity_loss)
                     for target, loss in group_losses.items():
                         epoch_group_train_losses[target].append(loss)
                     return value
-                score_value = _competition_score_loss(y_pred, actual)
+                score_value = _competition_score_loss(
+                    predicted_capacity, actual_capacity
+                )
                 history: dict[str, Any] = {
                     'step': len(self.training_history) + 1,
                     'train_loss': (
@@ -162,6 +185,15 @@ class RealMLPModel(RegressionModel):
                     'validation_score': -float(
                         score_value.detach().mean().cpu()
                     ),
+                    'training_objective_loss': (
+                        float(np.mean(epoch_objective_train_losses))
+                        if epoch_objective_train_losses else None
+                    ),
+                    'activity_train_loss': (
+                        float(np.mean(epoch_activity_train_losses))
+                        if epoch_activity_train_losses else None
+                    ),
+                    'activity_validation_loss': mean_activity_loss,
                 }
                 for index, target in enumerate(self.target_names):
                     train_losses = epoch_group_train_losses[target]
@@ -170,14 +202,16 @@ class RealMLPModel(RegressionModel):
                     )
                     history[f'{target}__validation_loss'] = group_losses[target]
                     group_score = _competition_score_loss(
-                        y_pred[..., index:index + 1],
-                        actual[..., index:index + 1],
+                        predicted_capacity[..., index:index + 1],
+                        actual_capacity[..., index:index + 1],
                     )
                     history[f'{target}__validation_score'] = -float(
                         group_score.detach().mean().cpu()
                     )
                 self.training_history.append(history)
                 epoch_train_losses.clear()
+                epoch_objective_train_losses.clear()
+                epoch_activity_train_losses.clear()
                 for losses in epoch_group_train_losses.values():
                     losses.clear()
                 return value
@@ -189,15 +223,24 @@ class RealMLPModel(RegressionModel):
         fallback_rows = min(512, len(X))
         fit_X_val = X_valid if has_validation else X.iloc[-fallback_rows:]
         fit_y_val = y_valid if has_validation else y.iloc[-fallback_rows:]
-        fit_y = np.array(y.to_numpy(dtype=np.float32), copy=True)
-        fit_y_val_array = np.array(
+        capacity_y = np.array(y.to_numpy(dtype=np.float32), copy=True)
+        capacity_y_val = np.array(
             fit_y_val.to_numpy(dtype=np.float32), copy=True
         )
-        # sklearn validation rejects NaN targets before PyTabKit reaches the
-        # custom loss. Zero is below the 10% competition eligibility threshold,
-        # so the masked loss gives missing targets exactly zero gradient.
-        fit_y[~np.isfinite(fit_y)] = 0.0
-        fit_y_val_array[~np.isfinite(fit_y_val_array)] = 0.0
+        observed_y = np.isfinite(capacity_y)
+        observed_y_val = np.isfinite(capacity_y_val)
+        activity_y = np.where(
+            observed_y, capacity_y >= 0.10, _MISSING_TARGET
+        ).astype(np.float32)
+        activity_y_val = np.where(
+            observed_y_val, capacity_y_val >= 0.10, _MISSING_TARGET
+        ).astype(np.float32)
+        capacity_y[~observed_y] = _MISSING_TARGET
+        capacity_y_val[~observed_y_val] = _MISSING_TARGET
+        fit_y = np.concatenate([capacity_y, activity_y], axis=1)
+        fit_y_val_array = np.concatenate(
+            [capacity_y_val, activity_y_val], axis=1
+        )
         self.model = RealMLP_TD_Regressor(
             device=self.device, random_state=self.config.seed,
             n_threads=self.n_threads, n_epochs=self.epochs,
@@ -242,18 +285,21 @@ class RealMLPModel(RegressionModel):
         if self.model is None:
             raise RuntimeError('RealMLP must be fitted before predict().')
         prediction = np.asarray(self.model.predict(X), dtype=float)
-        return prediction.reshape(len(X), len(self.target_names))
+        prediction = prediction.reshape(len(X), 2 * len(self.target_names))
+        return prediction[:, :len(self.target_names)]
 
     def metadata(self) -> dict[str, Any]:
         return {
             'model': 'RealMLP-TD', 'training': 'supervised-gradient',
-            'architecture': 'shared-trunk-multi-head',
+            'architecture': 'shared-trunk-capacity-and-activity-heads',
             'targets': self.target_names,
             'max_epochs': self.epochs, 'best_iteration': self.best_iteration,
             'validation_metric': 'ficr-aware-loss', 'n_ens': 8,
             'loss_name': 'ficr-aware', 'selection_metric': 'ficr-aware-loss',
             'ficr_weight': self.config.ficr_weight,
             'ficr_temperature': self.config.ficr_temperature,
+            'activity_loss_weight': self.config.activity_loss_weight,
+            'activity_threshold': 0.10,
             'learning_rate': self.config.learning_rate,
             'lr_schedule': 'coslog4',
             'dropout': 0.15,
@@ -264,7 +310,7 @@ class RealMLPModel(RegressionModel):
             'squared_momentum': 0.95,
             'weight_parameterization': 'ntk',
             'target_normalization': False,
-            'target_masking': 'finite-target-and-capacity-factor>=0.10',
+            'target_masking': 'missing=-1; capacity>=0.10; activity=all-observed',
             'early_stopping': self.early_stopping_enabled,
             'training_history': self.training_history,
             'device': self.device, 'n_threads': self.n_threads,

@@ -1,6 +1,6 @@
 # DACON 풍력 발전량 예측 — Version 4
 
-기상 예보 기반 풍력 발전량 예측 파이프라인입니다. Version 3에서 RealMLP을 200 epoch로 학습하며 LR 0.2, 0.02, 0.002를 비교했습니다. Version 4는 LR 0.02를 기준으로 세 발전 그룹을 함께 학습하는 multi-task learning을 실험합니다.
+기상 예보 기반 풍력 발전량 예측 파이프라인입니다. Version 3에서 RealMLP을 200 epoch로 학습하며 LR 0.2, 0.02, 0.002를 비교했습니다. Version 4는 LR 0.02의 multi-task RealMLP에 activity auxiliary objective를 추가해 저출력 관측도 학습 신호로 사용합니다.
 
 - [Version 1 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v1.0.0): 5개 baseline 비교
 - [Version 2 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v2.0.0): FICR-aware 모델 비교와 RealMLP 선정
@@ -54,19 +54,27 @@ Version 3에서 train loss 수렴이 가장 안정적이었던 LR 0.02를 기준
 
 기본 FICR 비중은 0.75, sigmoid temperature는 0.01입니다. 전체 loss와 함께 그룹별 train loss, validation loss, competition score를 기록해 한 그룹의 개선이 다른 그룹의 악화에 가려지지 않도록 합니다.
 
+### Activity auxiliary objective
+
+기존 capacity loss는 평가 대상인 capacity factor 0.10 이상에서만 계산되어, 학습에 로드된 행 중 약 34.8%는 모든 그룹의 loss가 0이었습니다. Version 4의 최종 실험은 각 그룹이 capacity factor 0.10 이상인지 예측하는 activity logit을 추가합니다.
+
+    train_loss = capacity_loss + 0.15 × activity_BCE
+
+결측 타깃은 `-1` sentinel로 분리하며 activity BCE는 결측을 제외한 실제 0 및 저출력 관측에도 적용합니다. best epoch는 기존 FICR-aware capacity validation loss로만 선택하고, submission에는 세 capacity 출력만 사용합니다.
+
 ## 4. 구현 및 산출물
 
-Version 4는 하나의 RealMLP을 한 번 학습해 세 그룹을 동시에 예측합니다. 결측 타깃은 0 sentinel로 바꾼 뒤 competition eligibility 조건인 capacity factor 0.10 미만 mask에서 제외하므로 해당 head에는 gradient가 전달되지 않습니다. Version 3의 그룹별 독립 학습 코드는 [v3.0.0 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v3.0.0)에 보존되어 있습니다.
+Version 4는 하나의 RealMLP을 한 번 학습해 세 그룹의 capacity와 activity를 동시에 학습합니다. Version 3의 그룹별 독립 학습 코드는 [v3.0.0 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v3.0.0)에 보존되어 있습니다.
 
 현재 전략은 `all-history-masked`입니다. 2022년 행도 학습에 유지해 group 1·2가 shared trunk를 업데이트하고, 정답이 없는 group 3 head의 loss만 제외합니다. 세 타깃이 모두 결측인 행만 학습에서 제거합니다.
 
     .\scripts\setup_env.ps1
-    .\scripts\run_models.ps1 -Models realmlp -Device cpu -EvaluationOnly -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
+    .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs @('--max-epochs','200','--learning-rate','0.02','--activity-loss-weight','0.15')
 
 Version 4 산출물은 기존 결과와 섞이지 않도록 다음 경로를 사용합니다.
 
-    model_outputs/v4/multitask_lr_0p02/
-    reports/v4/multitask_lr_0p02/
+    model_outputs/v4/activity_aux_lr_0p02/
+    reports/v4/activity_aux_lr_0p02/
 
 - results.csv: 전체 validation 및 DACON 지표
 - group_metrics.csv: 타깃별 지표
@@ -123,8 +131,11 @@ LR 0.002는 가장 높은 validation score를 기록했지만 DACON score는 LR 
 |:---|---:|---:|---:|---:|
 | Version 3 독립 RealMLP, LR 0.02 | 0.650715 | 0.876935 | 0.424495 | 그룹별 64~81 |
 | Version 4 masked multi-task | 0.660839 | 0.880581 | 0.441097 | joint 45 |
+| Version 4 + activity auxiliary | 0.666023 | 0.880581 | 0.451466 | joint 44 |
 
 Multi-task는 독립 학습보다 validation score가 0.010124 상승했습니다. 1-NMAE는 0.003646, FICR은 0.016602 상승해 전체적인 오차와 임계 구간 적중률이 모두 개선됐습니다. 특히 group 3는 NMAE가 0.142528에서 0.132280으로 감소하고 FICR이 0.357124에서 0.380157로 상승해 shared trunk의 이득이 가장 컸습니다.
+
+Activity auxiliary는 direct multi-task보다 validation score가 0.005184 상승했습니다. 1-NMAE는 동일하고 FICR이 0.010369 상승했습니다. DACON public score는 `0.632874`로, 1-NMAE `0.864029`, FICR `0.401719`를 기록했습니다. 개선 폭은 작지만 기존에 버리던 저출력 관측을 보조 신호로 활용하는 효과가 확인됐습니다.
 
 | 구분 | 최저 validation loss (epoch) | 해당 epoch train loss | 마지막 train loss | 마지막 validation loss |
 |:---|---:|---:|---:|---:|
@@ -135,4 +146,6 @@ Multi-task는 독립 학습보다 validation score가 0.010124 상승했습니�
 
 Validation loss는 0.5에서 학습되지 않은 것이 아니라 전체 기준 epoch 45까지 0.460531로 감소한 뒤 다시 상승했습니다. 반면 train loss는 0.097565까지 계속 감소했으므로 주된 문제는 수렴 실패나 결측 mask가 아니라 과적합입니다. joint epoch 45 선택은 정상적으로 동작했습니다. 이번 실험은 validation 비교까지만 사용하며 submission은 생성하지 않습니다.
 
-![Version 4 multi-task train/validation loss](reports/v4/multitask_lr_0p02/figures/training_curves.png)
+Activity 실험도 epoch 44에서 capacity validation loss `0.456359`를 기록한 뒤 epoch 200에는 `0.527273`으로 상승했습니다. 같은 기간 train loss는 `0.480889`에서 `0.079315`로 감소해, 보조 학습이 점수를 일부 개선했지만 과적합 자체는 해소하지 못했습니다. 다음 버전에서는 학습 구조를 변경해 과적합 완화를 시도합니다.
+
+![Version 4 activity auxiliary train/validation loss](reports/v4/activity_aux_lr_0p02/figures/training_curves.png)

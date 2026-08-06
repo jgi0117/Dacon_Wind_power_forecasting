@@ -139,6 +139,13 @@ def _history_frame(reports: dict[str, dict[str, Any]]) -> pd.DataFrame:
                     'train_loss': item.get('train_loss'),
                     'validation_loss': item.get('validation_loss'),
                     'validation_score': item.get('validation_score'),
+                    'training_objective_loss': item.get(
+                        'training_objective_loss'
+                    ),
+                    'activity_train_loss': item.get('activity_train_loss'),
+                    'activity_validation_loss': item.get(
+                        'activity_validation_loss'
+                    ),
                 })
                 for target in TARGETS:
                     rows.append({
@@ -159,6 +166,8 @@ def _history_frame(reports: dict[str, dict[str, Any]]) -> pd.DataFrame:
     columns = (
         'model', 'target', 'step', 'train_loss',
         'validation_loss', 'validation_score',
+        'training_objective_loss', 'activity_train_loss',
+        'activity_validation_loss',
     )
     return pd.DataFrame(rows, columns=columns)
 

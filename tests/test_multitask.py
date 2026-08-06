@@ -6,7 +6,9 @@ import numpy as np
 import pandas as pd
 import torch
 
-from baram.metrics import CAPACITY_KWH, TARGET_COLS, ficr_aware_loss_torch
+from baram.metrics import (
+    CAPACITY_KWH, TARGET_COLS, activity_loss_torch, ficr_aware_loss_torch,
+)
 from baram.workflows.training import (
     _all_history_masked_training_data,
     _capacity_factor_frame,
@@ -28,6 +30,15 @@ class MultiTaskLossTest(unittest.TestCase):
         self.assertEqual(loss.shape, (1,))
         self.assertTrue(torch.isfinite(loss).all())
         self.assertEqual(float(prediction.grad[0, 0, 2]), 0.0)
+
+    def test_activity_loss_uses_low_output_and_masks_missing(self) -> None:
+        actual = torch.tensor([[0.0, 1.0, -1.0], [1.0, 0.0, 1.0]])
+        logits = torch.zeros((1, 2, 3), requires_grad=True)
+        loss = activity_loss_torch(actual, logits)
+        loss.mean().backward()
+        self.assertEqual(loss.shape, (1,))
+        self.assertGreater(abs(float(logits.grad[0, 0, 0])), 0.0)
+        self.assertEqual(float(logits.grad[0, 0, 2]), 0.0)
 
 
 class MultiTaskScalingTest(unittest.TestCase):

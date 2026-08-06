@@ -30,6 +30,7 @@ class PipelineConfig:
     learning_rate: float = 0.02
     ficr_weight: float = 0.75
     ficr_temperature: float = 0.01
+    activity_loss_weight: float = 0.15
     device: str | None = None
     evaluation_only: bool = False
 
@@ -60,6 +61,7 @@ def parse_args() -> PipelineConfig:
     parser.add_argument('--learning-rate', type=float, default=0.02)
     parser.add_argument('--ficr-weight', type=float, default=0.75)
     parser.add_argument('--ficr-temperature', type=float, default=0.01)
+    parser.add_argument('--activity-loss-weight', type=float, default=0.15)
     parser.add_argument('--device', default=None, help='cpu, cuda, or omit for auto')
     parser.add_argument('--evaluation-only', action='store_true')
     values = vars(parser.parse_args())
@@ -77,6 +79,8 @@ def parse_args() -> PipelineConfig:
         parser.error('--ficr-weight must be between 0 and 1.')
     if values['ficr_temperature'] <= 0.0:
         parser.error('--ficr-temperature must be positive.')
+    if values['activity_loss_weight'] < 0.0:
+        parser.error('--activity-loss-weight must be non-negative.')
     requested_models = values.pop('models')
     if requested_models is None:
         models = DEFAULT_MODEL_NAMES
@@ -89,8 +93,8 @@ def parse_args() -> PipelineConfig:
     output_dir = values.pop('output_dir')
     if output_dir is None:
         output_dir = (
-            Path('model_outputs/v4/multitask_lr_0p02/runs/realmlp')
+            Path('model_outputs/v4/activity_aux_lr_0p02/runs/realmlp')
             if requested_models is None
-            else Path('model_outputs/v4/multitask_lr_0p02/runs') / '_'.join(models)
+            else Path('model_outputs/v4/activity_aux_lr_0p02/runs') / '_'.join(models)
         )
     return PipelineConfig(models=models, output_dir=output_dir, **values)

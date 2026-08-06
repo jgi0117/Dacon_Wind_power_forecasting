@@ -139,6 +139,39 @@ def ficr_aware_loss_torch(
     )
 
 
+def activity_loss_torch(actual: Any, logits: Any) -> Any:
+    '''Masked binary loss for whether an observed capacity factor is >= 10%.'''
+    import torch
+    import torch.nn.functional as functional
+
+    if actual.ndim < logits.ndim:
+        actual = actual.unsqueeze(0).expand_as(logits)
+    elif logits.ndim < actual.ndim:
+        logits = logits.unsqueeze(0).expand_as(actual)
+    if actual.shape != logits.shape:
+        actual = torch.broadcast_to(actual, logits.shape)
+    if actual.ndim < 2:
+        actual = actual.reshape(-1, 1)
+        logits = logits.reshape(-1, 1)
+    observed = torch.isfinite(actual) & (actual >= 0.0)
+    labels = (actual >= 0.10).to(logits.dtype)
+    safe_logits = torch.where(observed, logits, torch.zeros_like(logits))
+    element_loss = functional.binary_cross_entropy_with_logits(
+        safe_logits, labels, reduction='none'
+    )
+    observed_float = observed.to(element_loss.dtype)
+    count = observed_float.sum(dim=-2)
+    group_loss = (
+        (element_loss * observed_float).sum(dim=-2) / count.clamp_min(1.0)
+    )
+    valid_groups = count > 0
+    return (
+        torch.where(valid_groups, group_loss, torch.zeros_like(group_loss))
+        .sum(dim=-1)
+        / valid_groups.sum(dim=-1).clamp_min(1)
+    )
+
+
 def metric_report(answer: pd.DataFrame, prediction: pd.DataFrame) -> dict[str, Any]:
     _validate_frames(answer, prediction)
     groups: dict[str, dict[str, float | int]] = {}

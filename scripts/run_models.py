@@ -44,7 +44,7 @@ def _experiment_name(pipeline_args: list[str]) -> str:
         elif argument.startswith('--learning-rate='):
             learning_rate = argument.split('=', 1)[1]
     normalized = format(float(learning_rate), 'g').replace('.', 'p')
-    return f'multitask_lr_{normalized}'
+    return f'activity_aux_lr_{normalized}'
 
 
 def parse_args() -> argparse.Namespace:
