@@ -13,6 +13,8 @@ The model uses an equal-weighted mean of the valid per-group FICR-aware losses.
 Missing group targets are replaced with a zero sentinel before entering PyTabKit.
 The loss masks capacity factors below 0.10, so a missing target contributes no
 gradient while the other available groups still update the shared trunk.
+This `all-history-masked` strategy retains 2022 rows for groups 1 and 2 and
+removes only rows where all three targets are missing.
 
 The validation run executes up to 200 epochs. The epoch with the lowest joint
 FICR-aware validation loss is used for final full-history training.

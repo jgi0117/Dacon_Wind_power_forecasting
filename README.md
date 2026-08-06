@@ -58,6 +58,8 @@ Version 3에서 train loss 수렴이 가장 안정적이었던 LR 0.02를 기준
 
 Version 4는 하나의 RealMLP을 한 번 학습해 세 그룹을 동시에 예측합니다. 결측 타깃은 0 sentinel로 바꾼 뒤 competition eligibility 조건인 capacity factor 0.10 미만 mask에서 제외하므로 해당 head에는 gradient가 전달되지 않습니다. Version 3의 그룹별 독립 학습 코드는 [v3.0.0 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v3.0.0)에 보존되어 있습니다.
 
+현재 전략은 `all-history-masked`입니다. 2022년 행도 학습에 유지해 group 1·2가 shared trunk를 업데이트하고, 정답이 없는 group 3 head의 loss만 제외합니다. 세 타깃이 모두 결측인 행만 학습에서 제거합니다.
+
     .\scripts\setup_env.ps1
     .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
 

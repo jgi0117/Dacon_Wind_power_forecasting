@@ -25,6 +25,7 @@ from ..splitting import SplitPlan, build_split_plan, delivery_month
 
 
 LOGGER = logging.getLogger("baram.pipeline")
+MULTITASK_STRATEGY = 'all-history-masked'
 
 
 def _json_default(value: Any) -> Any:
@@ -40,6 +41,21 @@ def _capacity_factor_frame(targets: pd.DataFrame) -> pd.DataFrame:
     for target in TARGET_COLS:
         result[target] /= CAPACITY_KWH[target]
     return result
+
+
+def _all_history_masked_training_data(
+    features: pd.DataFrame,
+    targets: pd.DataFrame,
+    eligible_rows: np.ndarray | pd.Series | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Keep every historical row with at least one observed target."""
+    available = targets[TARGET_COLS].notna().any(axis=1).to_numpy()
+    if eligible_rows is not None:
+        available &= np.asarray(eligible_rows, dtype=bool)
+    return (
+        features.loc[available],
+        _capacity_factor_frame(targets.loc[available]),
+    )
 
 
 def _restore_prediction_frame(
@@ -77,13 +93,11 @@ def _fit_validation_models(
 ]:
     predictions: dict[str, pd.DataFrame] = {}
     metadata: dict[str, dict[str, Any]] = {name: {} for name in config.models}
-    fit_available = y_fit[TARGET_COLS].notna().any(axis=1)
     tune_available = (
         early_stopping_mask
         & y_validation[TARGET_COLS].notna().any(axis=1).to_numpy()
     )
-    X_joint = X_fit.loc[fit_available]
-    y_joint = _capacity_factor_frame(y_fit.loc[fit_available])
+    X_joint, y_joint = _all_history_masked_training_data(X_fit, y_fit)
     X_tune = X_validation.loc[tune_available]
     y_tune = _capacity_factor_frame(y_validation.loc[tune_available])
     for model_name in config.models:
@@ -103,6 +117,9 @@ def _fit_validation_models(
             model.predict(X_validation), X_validation.index
         )
         model_metadata['n_fit_rows'] = int(len(X_joint))
+        model_metadata['multitask_strategy'] = MULTITASK_STRATEGY
+        model_metadata['fit_start'] = X_joint.index.min()
+        model_metadata['fit_end'] = X_joint.index.max()
         model_metadata['n_fit_rows_by_target'] = {
             target: int(y_joint[target].notna().sum())
             for target in TARGET_COLS
@@ -123,9 +140,9 @@ def _fit_final_models(
 ) -> dict[str, pd.DataFrame]:
     predictions: dict[str, pd.DataFrame] = {}
     time_available = X_train.index < final_fit_cutoff
-    available = time_available & y_train[TARGET_COLS].notna().any(axis=1).to_numpy()
-    X_joint = X_train.loc[available]
-    y_joint = _capacity_factor_frame(y_train.loc[available])
+    X_joint, y_joint = _all_history_masked_training_data(
+        X_train, y_train, time_available
+    )
     if X_joint.index.max() >= final_fit_cutoff:
         raise RuntimeError("최종 학습 정답에 예측기준시점 이후 행이 포함됐습니다.")
     for model_name in config.models:

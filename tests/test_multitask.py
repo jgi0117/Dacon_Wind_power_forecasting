@@ -8,6 +8,7 @@ import torch
 
 from baram.metrics import CAPACITY_KWH, TARGET_COLS, ficr_aware_loss_torch
 from baram.workflows.training import (
+    _all_history_masked_training_data,
     _capacity_factor_frame,
     _restore_prediction_frame,
 )
@@ -30,6 +31,32 @@ class MultiTaskLossTest(unittest.TestCase):
 
 
 class MultiTaskScalingTest(unittest.TestCase):
+    def test_all_history_keeps_rows_with_partial_targets(self) -> None:
+        index = pd.date_range('2022-12-31 23:00', periods=4, freq='h')
+        features = pd.DataFrame({'x': [1.0, 2.0, 3.0, 4.0]}, index=index)
+        targets = pd.DataFrame(
+            [
+                [10_800.0, 5_400.0, np.nan],
+                [12_000.0, 6_000.0, np.nan],
+                [13_000.0, 7_000.0, 10_500.0],
+                [np.nan, np.nan, np.nan],
+            ],
+            index=index,
+            columns=TARGET_COLS,
+        )
+
+        selected_x, selected_y = _all_history_masked_training_data(
+            features, targets
+        )
+
+        self.assertEqual(list(selected_x.index), list(index[:3]))
+        self.assertTrue(
+            pd.isna(selected_y.loc[index[0], 'kpx_group_3'])
+        )
+        self.assertAlmostEqual(
+            selected_y.loc[index[0], 'kpx_group_1'], 0.5
+        )
+
     def test_capacity_factor_round_trip_and_shape(self) -> None:
         index = pd.date_range('2024-01-01', periods=2, freq='h')
         generation = pd.DataFrame(
