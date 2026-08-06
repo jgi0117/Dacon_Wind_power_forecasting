@@ -4,6 +4,7 @@
 
 - [Version 1 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v1.0.0): 5개 baseline 비교
 - [Version 2 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v2.0.0): FICR-aware 모델 비교와 RealMLP 선정
+- [Version 3 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v3.0.0): RealMLP 200-epoch learning-rate 비교
 
 ## 1. 프로젝트 개요
 
@@ -110,4 +111,8 @@ LR 0.002는 가장 높은 validation score를 기록했지만 DACON score는 LR 
 
 ![LR 0.002 RealMLP train/validation loss](reports/v3/lr_0p002/figures/training_curves.png)
 
-## 6. 다음 단계
+## 6. Version 3 결론
+
+Version 3의 범위는 RealMLP의 LR 0.2, 0.02, 0.002 비교로 마무리합니다. 세 설정의 DACON score 차이는 최대 0.005256으로 크지 않았고, 모든 설정에서 train loss는 계속 감소하지만 validation loss는 0.4~0.5 부근에서 정체하거나 다시 상승했습니다. 독립 타깃 모델의 과적합과 타깃별 데이터 활용 한계를 다음 실험의 핵심 문제로 봅니다.
+
+DACON 최고점은 LR 0.2였지만, LR 0.02가 train loss를 가장 안정적으로 낮추면서 각 타깃의 validation 최저점도 LR 0.2보다 개선했습니다. 따라서 Version 4의 기준 LR은 0.02로 고정합니다. Version 4에서는 세 그룹을 함께 학습하고 그룹 간 공통 표현을 공유하는 multi-task learning을 검증합니다.
