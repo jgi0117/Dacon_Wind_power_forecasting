@@ -20,6 +20,9 @@ def build_model(
     if name == 'realmlp':
         from .realmlp_model import RealMLPModel
         return RealMLPModel(config, epochs=iterations)
+    if name == 'realmlp_adapter':
+        from .realmlp_adapter_model import RealMLPAdapterModel
+        return RealMLPAdapterModel(config, epochs=iterations)
     raise ValueError(f'Unsupported model: {name}')
 
 

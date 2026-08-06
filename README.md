@@ -43,6 +43,8 @@
 
 하나의 shared trunk가 세 그룹의 공통 기상·시간 표현을 학습하고, 3-output prediction layer의 그룹별 head가 각 발전량을 출력합니다. 특정 그룹의 타깃이 없는 행은 해당 그룹 loss에서만 제외하는 target mask를 사용합니다. 따라서 group 1 head는 그룹 2·3의 정답을 직접 입력받지 않지만, shared trunk에 전달되는 gradient를 통해 다른 그룹의 학습 신호를 간접적으로 활용할 수 있습니다.
 
+추가 비교 모델 `realmlp_adapter`는 shared trunk `655→256→128` 뒤에 그룹별 `128→64→1` adapter를 둡니다. 각 adapter의 가중치는 해당 그룹 loss로만 업데이트되고 shared trunk는 세 그룹의 평균 loss로 업데이트됩니다. PyTabKit RealMLP은 분기형 hidden layer를 지원하지 않으므로 adapter 모델은 PyTorch로 구현했으며, median/IQR scaling과 ±10 clipping을 사용합니다.
+
 Version 3에서 train loss 수렴이 가장 안정적이었던 LR 0.02를 기준값으로 고정합니다. 최대 200 epoch를 실행하고 세 그룹의 평균 validation loss가 가장 낮은 epoch를 최종 전체 데이터 재학습 길이로 사용합니다. Version 3와 동일하게 `lr_sched=coslog4`, dropout 0.15, Adam을 유지해 모델 구조 변화의 효과만 비교합니다.
 
 ### FICR-aware loss
@@ -62,6 +64,10 @@ Version 4는 하나의 RealMLP을 한 번 학습해 세 그룹을 동시에 예�
 
     .\scripts\setup_env.ps1
     .\scripts\run_models.ps1 -Models realmlp -Device cpu -EvaluationOnly -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
+
+그룹별 adapter 모델을 validation까지만 실행하는 명령:
+
+    .\scripts\run_models.ps1 -Models realmlp_adapter -Device cpu -EvaluationOnly -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
 
 Version 4 산출물은 기존 결과와 섞이지 않도록 다음 경로를 사용합니다.
 
@@ -136,3 +142,5 @@ Multi-task는 독립 학습보다 validation score가 0.010124 상승했습니�
 Validation loss는 0.5에서 학습되지 않은 것이 아니라 전체 기준 epoch 45까지 0.460531로 감소한 뒤 다시 상승했습니다. 반면 train loss는 0.097565까지 계속 감소했으므로 주된 문제는 수렴 실패나 결측 mask가 아니라 과적합입니다. joint epoch 45 선택은 정상적으로 동작했습니다. 이번 실험은 validation 비교까지만 사용하며 submission은 생성하지 않습니다.
 
 ![Version 4 multi-task train/validation loss](reports/v4/multitask_lr_0p02/figures/training_curves.png)
+
+다음 비교는 동일한 LR, loss, split, 200-epoch 조건에서 `realmlp_adapter`가 group 3의 이른 과적합과 task 간 학습 속도 차이를 완화하는지 확인합니다. AdapterMLP는 PyTabKit의 PLR embedding과 8-model ensemble을 사용하지 않으므로 결과 해석 시 adapter 구조뿐 아니라 구현 및 전처리 차이도 함께 고려합니다.

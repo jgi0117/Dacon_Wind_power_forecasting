@@ -5,6 +5,11 @@ Version 4 uses one shared-trunk RealMLP with three regression outputs in Python 
     .\scripts\setup_env.ps1
     .\scripts\run_models.ps1 -Models realmlp -Device cpu -EvaluationOnly -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
 
+The task-adapter variant uses a PyTorch `655→256→128` shared trunk and three
+independent `128→64→1` adapters:
+
+    .\scripts\run_models.ps1 -Models realmlp_adapter -Device cpu -EvaluationOnly -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
+
 The model uses an equal-weighted mean of the valid per-group FICR-aware losses.
 
     group_loss = 0.25 * smooth-MAE + 0.75 * (1 - soft-FICR)

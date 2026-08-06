@@ -46,7 +46,7 @@ def parse_args() -> PipelineConfig:
         nargs='+',
         choices=SUPPORTED_MODEL_NAMES + ('all',),
         default=None,
-        help='Version 4 uses one multi-task RealMLP.',
+        help='Version 4 supports RealMLP and the task-adapter variant.',
     )
     parser.add_argument('--validation-start', default='2024-01-01 01:00:00')
     parser.add_argument('--iteration-selection-end', default='2024-04-01 01:00:00')

@@ -12,13 +12,15 @@ import numpy as np
 import pandas as pd
 
 
-MODELS = ('realmlp',)
+MODELS = ('realmlp', 'realmlp_adapter')
 TARGETS = ('kpx_group_1', 'kpx_group_2', 'kpx_group_3')
 DISPLAY_NAMES = {
     'realmlp': 'RealMLP',
+    'realmlp_adapter': 'RealMLP Adapter',
 }
 LOSS_NAMES = {
     'realmlp': 'ficr-aware',
+    'realmlp_adapter': 'ficr-aware',
 }
 
 
@@ -236,34 +238,45 @@ def _plot_dacon_components(results: pd.DataFrame, path: Path) -> None:
 
 
 def _plot_histories(history: pd.DataFrame, path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(10, 6))
+    available_models = [
+        model for model in MODELS if (history['model'] == model).any()
+    ]
+    fig, axes = plt.subplots(
+        len(available_models),
+        1,
+        figsize=(10, 5.5 * len(available_models)),
+        squeeze=False,
+    )
     plotted_targets = ('all', *TARGETS)
     colors = dict(zip(
         plotted_targets,
         ('#222222', '#2878B5', '#E07B39', '#4E9F3D'),
         strict=True,
     ))
-    model_history = history.loc[history['model'] == 'realmlp']
-    for target in plotted_targets:
-        target_history = model_history.loc[model_history['target'] == target]
-        if target_history.empty:
-            continue
-        if target_history['train_loss'].notna().any():
-            ax.plot(
-                target_history['step'], target_history['train_loss'],
-                linestyle='--', color=colors[target], alpha=0.75,
-                label=f'{target} train',
-            )
-        if target_history['validation_loss'].notna().any():
-            ax.plot(
-                target_history['step'], target_history['validation_loss'],
-                color=colors[target], label=f'{target} validation',
-            )
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('FICR-aware loss')
-    ax.set_title('Version 4 multi-task RealMLP train / validation history')
-    ax.grid(alpha=0.25)
-    ax.legend(fontsize=8, ncol=2)
+    for ax, model in zip(axes[:, 0], available_models, strict=True):
+        model_history = history.loc[history['model'] == model]
+        for target in plotted_targets:
+            target_history = model_history.loc[
+                model_history['target'] == target
+            ]
+            if target_history.empty:
+                continue
+            if target_history['train_loss'].notna().any():
+                ax.plot(
+                    target_history['step'], target_history['train_loss'],
+                    linestyle='--', color=colors[target], alpha=0.75,
+                    label=f'{target} train',
+                )
+            if target_history['validation_loss'].notna().any():
+                ax.plot(
+                    target_history['step'], target_history['validation_loss'],
+                    color=colors[target], label=f'{target} validation',
+                )
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('FICR-aware loss')
+        ax.set_title(f'{DISPLAY_NAMES[model]} train / validation history')
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8, ncol=2)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -321,24 +334,23 @@ def main() -> None:
     training.to_csv(output / 'training_summary.csv', index=False, encoding='utf-8')
     history_path = output / 'training_history.csv'
     history_figure = figures / 'training_curves.png'
-    realmlp_history = history.loc[history['model'] == 'realmlp']
     if history.empty:
         history_path.unlink(missing_ok=True)
     else:
         history.to_csv(history_path, index=False, encoding='utf-8')
-    if realmlp_history.empty:
+    if history.empty:
         history_figure.unlink(missing_ok=True)
     else:
-        _plot_histories(realmlp_history, history_figure)
+        _plot_histories(history, history_figure)
     monthly.to_csv(output / 'monthly_metrics.csv', index=False, encoding='utf-8')
     _plot_scores(results, figures / 'score_comparison.png')
     _plot_dacon_components(results, figures / 'dacon_components.png')
     history_section = (
         '\n\n![Training curves](figures/training_curves.png)\n\n'
-        if not realmlp_history.empty else '\n\n'
+        if not history.empty else '\n\n'
     )
     (output / 'RESULTS.md').write_text(
-        '# Version 4 multi-task RealMLP results\n\n'
+        '# Version 4 multi-task model results\n\n'
         + _markdown_table(results)
         + '\n\n![Validation score](figures/score_comparison.png)\n\n'
         + '![DACON components](figures/dacon_components.png)\n\n'
