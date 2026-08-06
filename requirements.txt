@@ -18,4 +18,4 @@ nbformat==5.10.4
 joblib==1.5.3
 tqdm==4.70.0
 
-# Version 3 model dependencies are pinned in requirements-py313.txt.
+# Version 4 model dependencies are pinned in requirements-py313.txt.

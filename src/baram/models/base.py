@@ -14,15 +14,15 @@ class RegressionModel(ABC):
     def fit(
         self,
         X: pd.DataFrame,
-        y: pd.Series,
+        y: pd.DataFrame | pd.Series,
         X_valid: pd.DataFrame | None = None,
-        y_valid: pd.Series | None = None,
+        y_valid: pd.DataFrame | pd.Series | None = None,
     ) -> "RegressionModel":
         """모델을 학습한다."""
 
     @abstractmethod
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """capacity factor를 추론한다."""
+        """하나 이상의 capacity factor를 추론한다."""
 
     @abstractmethod
     def metadata(self) -> dict[str, Any]:

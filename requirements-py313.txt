@@ -1,4 +1,4 @@
-# Python 3.13 environment: RealMLP only.
+# Python 3.13 environment: Version 4 multi-task RealMLP.
 numpy==2.4.6
 pandas==3.0.3
 scipy==1.17.1

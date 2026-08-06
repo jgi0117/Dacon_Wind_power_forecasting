@@ -95,11 +95,17 @@ def _result_frames(
                 'target': target,
                 **metric,
             })
-            metadata = payload.get('model_metadata', {}).get(model, {}).get(target, {})
+            metadata_by_target = payload.get('model_metadata', {}).get(model, {})
+            metadata = metadata_by_target.get(
+                'multitask', metadata_by_target.get(target, {})
+            )
+            rows_by_target = metadata.get('n_fit_rows_by_target', {})
             training.append({
                 'model': model,
                 'target': target,
-                'n_fit_rows': metadata.get('n_fit_rows'),
+                'n_fit_rows': rows_by_target.get(
+                    target, metadata.get('n_fit_rows')
+                ),
                 'best_iteration': metadata.get('best_iteration'),
                 'max_training_length': metadata.get(
                     'max_epochs', metadata.get('max_iterations')
@@ -124,6 +130,29 @@ def _history_frame(reports: dict[str, dict[str, Any]]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for model, payload in reports.items():
         metadata_by_target = payload.get('model_metadata', {}).get(model, {})
+        multitask = metadata_by_target.get('multitask')
+        if multitask:
+            for item in multitask.get('training_history', []):
+                rows.append({
+                    'model': model, 'target': 'all',
+                    'step': item.get('step'),
+                    'train_loss': item.get('train_loss'),
+                    'validation_loss': item.get('validation_loss'),
+                    'validation_score': item.get('validation_score'),
+                })
+                for target in TARGETS:
+                    rows.append({
+                        'model': model, 'target': target,
+                        'step': item.get('step'),
+                        'train_loss': item.get(f'{target}__train_loss'),
+                        'validation_loss': item.get(
+                            f'{target}__validation_loss'
+                        ),
+                        'validation_score': item.get(
+                            f'{target}__validation_score'
+                        ),
+                    })
+            continue
         for target, metadata in metadata_by_target.items():
             for item in metadata.get('training_history', []):
                 rows.append({'model': model, 'target': target, **item})
@@ -159,7 +188,7 @@ def _plot_scores(results: pd.DataFrame, path: Path) -> None:
         )
         ax.legend()
     ax.set_xlabel('Score (higher is better)')
-    ax.set_title('Version 3 RealMLP chronological validation score')
+    ax.set_title('Version 4 multi-task RealMLP chronological validation score')
     lower = max(0.0, float(ordered['validation_score'].min()) - 0.03)
     upper_values = [float(ordered['validation_score'].max())]
     if ordered['dacon_score'].notna().any():
@@ -208,9 +237,14 @@ def _plot_dacon_components(results: pd.DataFrame, path: Path) -> None:
 
 def _plot_histories(history: pd.DataFrame, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(10, 6))
-    colors = dict(zip(TARGETS, ('#2878B5', '#E07B39', '#4E9F3D'), strict=True))
+    plotted_targets = ('all', *TARGETS)
+    colors = dict(zip(
+        plotted_targets,
+        ('#222222', '#2878B5', '#E07B39', '#4E9F3D'),
+        strict=True,
+    ))
     model_history = history.loc[history['model'] == 'realmlp']
-    for target in TARGETS:
+    for target in plotted_targets:
         target_history = model_history.loc[model_history['target'] == target]
         if target_history.empty:
             continue
@@ -227,7 +261,7 @@ def _plot_histories(history: pd.DataFrame, path: Path) -> None:
             )
     ax.set_xlabel('Epoch')
     ax.set_ylabel('FICR-aware loss')
-    ax.set_title('RealMLP 200-epoch train / validation history')
+    ax.set_title('Version 4 multi-task RealMLP train / validation history')
     ax.grid(alpha=0.25)
     ax.legend(fontsize=8, ncol=2)
     fig.tight_layout()
@@ -257,10 +291,14 @@ def _markdown_table(results: pd.DataFrame) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '--runs-dir', type=Path, default=Path('model_outputs/v3/lr_0p02/runs')
+        '--runs-dir',
+        type=Path,
+        default=Path('model_outputs/v4/multitask_lr_0p02/runs'),
     )
     parser.add_argument(
-        '--output-dir', type=Path, default=Path('reports/v3/lr_0p02')
+        '--output-dir',
+        type=Path,
+        default=Path('reports/v4/multitask_lr_0p02'),
     )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -300,7 +338,7 @@ def main() -> None:
         if not realmlp_history.empty else '\n\n'
     )
     (output / 'RESULTS.md').write_text(
-        '# Version 3 RealMLP results\n\n'
+        '# Version 4 multi-task RealMLP results\n\n'
         + _markdown_table(results)
         + '\n\n![Validation score](figures/score_comparison.png)\n\n'
         + '![DACON components](figures/dacon_components.png)\n\n'

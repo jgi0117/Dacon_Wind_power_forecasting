@@ -1,15 +1,22 @@
-# Version 3 RealMLP execution
+# Version 4 multi-task RealMLP execution
 
-Version 3 supports only RealMLP in Python 3.13.
+Version 4 uses one shared-trunk RealMLP with three regression outputs in Python 3.13.
 
     .\scripts\setup_env.ps1
     .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
 
-The model uses the FICR-aware loss below and records train loss, validation loss, and competition score for every epoch.
+The model uses an equal-weighted mean of the valid per-group FICR-aware losses.
 
-    0.25 * smooth-MAE + 0.75 * (1 - soft-FICR)
+    group_loss = 0.25 * smooth-MAE + 0.75 * (1 - soft-FICR)
+    total_loss = mean(valid group losses)
 
-The validation run executes up to 200 epochs. The epoch with the lowest FICR-aware validation loss is used for final full-history training.
+Missing group targets are replaced with a zero sentinel before entering PyTabKit.
+The loss masks capacity factors below 0.10, so a missing target contributes no
+gradient while the other available groups still update the shared trunk.
 
-Outputs are grouped by learning rate. For example, LR 0.02 is stored under
-`model_outputs/v3/lr_0p02/runs/realmlp` and `reports/v3/lr_0p02`.
+The validation run executes up to 200 epochs. The epoch with the lowest joint
+FICR-aware validation loss is used for final full-history training.
+
+LR 0.02 outputs are stored under
+`model_outputs/v4/multitask_lr_0p02/runs/realmlp` and
+`reports/v4/multitask_lr_0p02`.

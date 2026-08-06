@@ -1,4 +1,4 @@
-'''Run selected models independently in the project Python environment.'''
+'''Run Version 4 multi-task models in the project Python environment.'''
 
 from __future__ import annotations
 
@@ -44,12 +44,12 @@ def _experiment_name(pipeline_args: list[str]) -> str:
         elif argument.startswith('--learning-rate='):
             learning_rate = argument.split('=', 1)[1]
     normalized = format(float(learning_rate), 'g').replace('.', 'p')
-    return f'lr_{normalized}'
+    return f'multitask_lr_{normalized}'
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='Train selected models independently in one environment.'
+        description='Train Version 4 multi-task models in one environment.'
     )
     parser.add_argument(
         '--models', nargs='+', required=True,
@@ -86,9 +86,9 @@ def main() -> None:
         extra_args = extra_args[1:]
     experiment_name = _experiment_name(extra_args)
     runs_dir_arg = args.runs_dir or (
-        Path('model_outputs/v3') / experiment_name / 'runs'
+        Path('model_outputs/v4') / experiment_name / 'runs'
     )
-    report_dir_arg = args.report_dir or Path('reports/v3') / experiment_name
+    report_dir_arg = args.report_dir or Path('reports/v4') / experiment_name
     runs_dir = (repo_root / runs_dir_arg).resolve()
 
     for model in models:

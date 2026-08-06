@@ -41,7 +41,7 @@
 4. 2024년 7~12월을 최종 비교 구간으로 유지합니다.
 5. 선택된 epoch로 사용 가능한 전체 과거 데이터를 다시 학습해 테스트를 예측합니다.
 
-하나의 shared trunk가 세 그룹의 공통 기상·시간 표현을 학습하고, 그룹별 prediction head가 각 발전량을 출력합니다. 특정 그룹의 타깃이 없는 행은 해당 그룹 loss에서만 제외하는 target mask를 사용합니다. 따라서 그룹 1 모델은 그룹 2·3의 정답을 직접 입력받지 않지만, shared trunk에 전달되는 gradient를 통해 다른 그룹의 학습 신호를 간접적으로 활용할 수 있습니다.
+하나의 shared trunk가 세 그룹의 공통 기상·시간 표현을 학습하고, 3-output prediction layer의 그룹별 head가 각 발전량을 출력합니다. 특정 그룹의 타깃이 없는 행은 해당 그룹 loss에서만 제외하는 target mask를 사용합니다. 따라서 group 1 head는 그룹 2·3의 정답을 직접 입력받지 않지만, shared trunk에 전달되는 gradient를 통해 다른 그룹의 학습 신호를 간접적으로 활용할 수 있습니다.
 
 Version 3에서 train loss 수렴이 가장 안정적이었던 LR 0.02를 기준값으로 고정합니다. 최대 200 epoch를 실행하고 세 그룹의 평균 validation loss가 가장 낮은 epoch를 최종 전체 데이터 재학습 길이로 사용합니다. Version 3와 동일하게 `lr_sched=coslog4`, dropout 0.15, Adam을 유지해 모델 구조 변화의 효과만 비교합니다.
 
@@ -56,7 +56,10 @@ Version 3에서 train loss 수렴이 가장 안정적이었던 LR 0.02를 기준
 
 ## 4. 구현 및 산출물
 
-Version 4 multi-task 학습 코드는 다음 구현 단계에서 추가합니다. 구현 전 현재 파이프라인을 실행하면 Version 3의 그룹별 독립 학습이 수행되므로, multi-task 결과로 취급하지 않습니다. Version 3 재현 방법은 [v3.0.0 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v3.0.0)에 보존되어 있습니다.
+Version 4는 하나의 RealMLP을 한 번 학습해 세 그룹을 동시에 예측합니다. 결측 타깃은 0 sentinel로 바꾼 뒤 competition eligibility 조건인 capacity factor 0.10 미만 mask에서 제외하므로 해당 head에는 gradient가 전달되지 않습니다. Version 3의 그룹별 독립 학습 코드는 [v3.0.0 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v3.0.0)에 보존되어 있습니다.
+
+    .\scripts\setup_env.ps1
+    .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
 
 Version 4 산출물은 기존 결과와 섞이지 않도록 다음 경로를 사용합니다.
 

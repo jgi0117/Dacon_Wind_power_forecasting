@@ -94,31 +94,49 @@ def ficr_aware_loss_torch(
     ficr_weight: float = 0.75,
     temperature: float = 0.01,
 ) -> Any:
-    '''PyTorch soft-FICR surrogate reduced across the final sample dimension.'''
+    '''Masked soft-FICR loss with equal weighting across target groups.'''
     import torch
 
-    actual = actual.squeeze(-1)
-    prediction = prediction.squeeze(-1)
     if actual.ndim < prediction.ndim:
         actual = actual.unsqueeze(0).expand_as(prediction)
     elif prediction.ndim < actual.ndim:
         prediction = prediction.unsqueeze(0).expand_as(actual)
     if actual.shape != prediction.shape:
         actual = torch.broadcast_to(actual, prediction.shape)
+
+    if actual.ndim < 2:
+        actual = actual.reshape(-1, 1)
+        prediction = prediction.reshape(-1, 1)
+
     valid = torch.isfinite(actual) & torch.isfinite(prediction) & (actual >= 0.10)
-    smooth_error = torch.sqrt((prediction - actual).square() + 1e-8)
+    safe_actual = torch.where(valid, actual, torch.zeros_like(actual))
+    safe_prediction = torch.where(valid, prediction, torch.zeros_like(prediction))
+    smooth_error = torch.sqrt((safe_prediction - safe_actual).square() + 1e-8)
     valid_float = valid.to(smooth_error.dtype)
-    count = valid_float.sum(dim=-1).clamp_min(1.0)
-    mae = (smooth_error * valid_float).sum(dim=-1) / count
+    sample_dim = -2
+    count = valid_float.sum(dim=sample_dim)
+    safe_count = count.clamp_min(1.0)
+    mae = (smooth_error * valid_float).sum(dim=sample_dim) / safe_count
     mean_actual = (
-        (actual * valid_float).sum(dim=-1) / count
+        (safe_actual * valid_float).sum(dim=sample_dim) / safe_count
     ).clamp_min(1e-12)
-    normalized_weight = actual / mean_actual.unsqueeze(-1)
+    normalized_weight = safe_actual / mean_actual.unsqueeze(sample_dim)
     sigmoid_6 = torch.sigmoid((0.06 - smooth_error) / temperature)
     sigmoid_8 = torch.sigmoid((0.08 - smooth_error) / temperature)
     soft_reward = normalized_weight * (3.0 * sigmoid_8 + sigmoid_6) / 4.0
-    soft_ficr = (soft_reward * valid_float).sum(dim=-1) / count
-    return (1.0 - ficr_weight) * mae + ficr_weight * (1.0 - soft_ficr)
+    soft_ficr = (
+        (soft_reward * valid_float).sum(dim=sample_dim) / safe_count
+    )
+    group_loss = (
+        (1.0 - ficr_weight) * mae + ficr_weight * (1.0 - soft_ficr)
+    )
+    valid_groups = count > 0
+    valid_group_count = valid_groups.sum(dim=-1).clamp_min(1)
+    return (
+        torch.where(valid_groups, group_loss, torch.zeros_like(group_loss))
+        .sum(dim=-1)
+        / valid_group_count
+    )
 
 
 def metric_report(answer: pd.DataFrame, prediction: pd.DataFrame) -> dict[str, Any]:

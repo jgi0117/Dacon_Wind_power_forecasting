@@ -27,7 +27,7 @@ class PipelineConfig:
     early_stopping_patience: int = 10
     early_stopping_min_delta: float = 1e-5
     batch_size: int = 256
-    learning_rate: float = 0.002
+    learning_rate: float = 0.02
     ficr_weight: float = 0.75
     ficr_temperature: float = 0.01
     device: str | None = None
@@ -46,7 +46,7 @@ def parse_args() -> PipelineConfig:
         nargs='+',
         choices=SUPPORTED_MODEL_NAMES + ('all',),
         default=None,
-        help='Only RealMLP is supported in Version 3.',
+        help='Version 4 uses one multi-task RealMLP.',
     )
     parser.add_argument('--validation-start', default='2024-01-01 01:00:00')
     parser.add_argument('--iteration-selection-end', default='2024-04-01 01:00:00')
@@ -89,8 +89,8 @@ def parse_args() -> PipelineConfig:
     output_dir = values.pop('output_dir')
     if output_dir is None:
         output_dir = (
-            Path('model_outputs/v3/runs/realmlp')
+            Path('model_outputs/v4/multitask_lr_0p02/runs/realmlp')
             if requested_models is None
-            else Path('model_outputs/v3/runs') / '_'.join(models)
+            else Path('model_outputs/v4/multitask_lr_0p02/runs') / '_'.join(models)
         )
     return PipelineConfig(models=models, output_dir=output_dir, **values)

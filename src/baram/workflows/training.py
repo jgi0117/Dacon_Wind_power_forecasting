@@ -1,8 +1,7 @@
-"""세 모델 학습·추론과 앙상블을 한 번에 실행하는 진입점."""
+"""Multi-task RealMLP 학습·평가·제출 생성을 실행하는 진입점."""
 
 from __future__ import annotations
 
-import gc
 import json
 import logging
 from dataclasses import asdict
@@ -16,11 +15,10 @@ from ..config import PipelineConfig, parse_args
 from ..constants import SUPPORTED_MODEL_NAMES
 from ..data import load_artifacts, write_submission
 from ..metrics import (
+    CAPACITY_KWH,
     TARGET_COLS,
-    capacity_factor,
     evaluate_complete_rows,
     flatten_report,
-    restore_generation,
 )
 from ..models import build_model
 from ..splitting import SplitPlan, build_split_plan, delivery_month
@@ -29,21 +27,40 @@ from ..splitting import SplitPlan, build_split_plan, delivery_month
 LOGGER = logging.getLogger("baram.pipeline")
 
 
-def _prediction_frames(
-    arrays: dict[str, np.ndarray], index: pd.Index
-) -> dict[str, pd.DataFrame]:
-    return {
-        name: pd.DataFrame(values, index=index, columns=TARGET_COLS)
-        for name, values in arrays.items()
-    }
-
-
 def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, (np.integer, np.floating)):
         return value.item()
     return str(value)
+
+
+def _capacity_factor_frame(targets: pd.DataFrame) -> pd.DataFrame:
+    result = targets.loc[:, TARGET_COLS].astype(float).copy()
+    for target in TARGET_COLS:
+        result[target] /= CAPACITY_KWH[target]
+    return result
+
+
+def _restore_prediction_frame(
+    prediction: np.ndarray, index: pd.Index
+) -> pd.DataFrame:
+    values = np.asarray(prediction, dtype=float)
+    if values.ndim == 1:
+        values = values.reshape(-1, 1)
+    expected_shape = (len(index), len(TARGET_COLS))
+    if values.shape != expected_shape:
+        raise ValueError(
+            f'Multi-task prediction shape mismatch: {values.shape} != {expected_shape}'
+        )
+    if not np.isfinite(values).all():
+        raise ValueError('Multi-task prediction contains NaN or infinite values.')
+    frame = pd.DataFrame(
+        np.clip(values, 0.0, 1.0), index=index, columns=TARGET_COLS
+    )
+    for target in TARGET_COLS:
+        frame[target] *= CAPACITY_KWH[target]
+    return frame
 
 
 def _fit_validation_models(
@@ -58,40 +75,42 @@ def _fit_validation_models(
     dict[str, pd.DataFrame], dict[str, dict[str, Any]],
     dict[str, dict[str, int]],
 ]:
-    arrays = {
-        name: np.zeros((len(X_validation), len(TARGET_COLS)), dtype=float)
-        for name in config.models
-    }
+    predictions: dict[str, pd.DataFrame] = {}
     metadata: dict[str, dict[str, Any]] = {name: {} for name in config.models}
-    for target_index, target in enumerate(TARGET_COLS):
-        available = y_fit[target].notna()
-        X_target = X_fit.loc[available]
-        y_target = capacity_factor(y_fit.loc[available, target], target)
-        tune_available = early_stopping_mask & y_validation[target].notna().to_numpy()
-        X_tune = X_validation.loc[tune_available]
-        y_tune = capacity_factor(y_validation.loc[tune_available, target], target)
-        for model_name in config.models:
-            iterations = iteration_schedule.get(model_name, {}).get(target)
-            LOGGER.info(
-                "검증 모델 고정 반복 학습: %s / %s / iterations=%s",
-                model_name,
-                target,
-                iterations,
-            )
-            model = build_model(model_name, config, iterations=iterations)
-            model.fit(X_target, y_target, X_tune, y_tune)
-            best_iteration = int(model.metadata()['best_iteration'])
-            iteration_schedule.setdefault(model_name, {})[target] = best_iteration
-            arrays[model_name][:, target_index] = restore_generation(
-                model.predict(X_validation), target
-            )
-            metadata[model_name][target] = model.metadata()
-            metadata[model_name][target]["n_fit_rows"] = int(len(X_target))
-            if iterations is not None:
-                metadata[model_name][target]["median_best_iteration"] = iterations
-            del model
-            gc.collect()
-    return _prediction_frames(arrays, X_validation.index), metadata, iteration_schedule
+    fit_available = y_fit[TARGET_COLS].notna().any(axis=1)
+    tune_available = (
+        early_stopping_mask
+        & y_validation[TARGET_COLS].notna().any(axis=1).to_numpy()
+    )
+    X_joint = X_fit.loc[fit_available]
+    y_joint = _capacity_factor_frame(y_fit.loc[fit_available])
+    X_tune = X_validation.loc[tune_available]
+    y_tune = _capacity_factor_frame(y_validation.loc[tune_available])
+    for model_name in config.models:
+        iterations = iteration_schedule.get(model_name, {}).get('multitask')
+        LOGGER.info(
+            "검증 multi-task 모델 학습: %s / rows=%d / iterations=%s",
+            model_name,
+            len(X_joint),
+            iterations,
+        )
+        model = build_model(model_name, config, iterations=iterations)
+        model.fit(X_joint, y_joint, X_tune, y_tune)
+        model_metadata = model.metadata()
+        best_iteration = int(model_metadata['best_iteration'])
+        iteration_schedule.setdefault(model_name, {})['multitask'] = best_iteration
+        predictions[model_name] = _restore_prediction_frame(
+            model.predict(X_validation), X_validation.index
+        )
+        model_metadata['n_fit_rows'] = int(len(X_joint))
+        model_metadata['n_fit_rows_by_target'] = {
+            target: int(y_joint[target].notna().sum())
+            for target in TARGET_COLS
+        }
+        if iterations is not None:
+            model_metadata['scheduled_iteration'] = iterations
+        metadata[model_name]['multitask'] = model_metadata
+    return predictions, metadata, iteration_schedule
 
 
 def _fit_final_models(
@@ -102,33 +121,27 @@ def _fit_final_models(
     iteration_schedule: dict[str, dict[str, int]],
     final_fit_cutoff: pd.Timestamp,
 ) -> dict[str, pd.DataFrame]:
-    arrays = {
-        name: np.zeros((len(X_test), len(TARGET_COLS)), dtype=float)
-        for name in config.models
-    }
+    predictions: dict[str, pd.DataFrame] = {}
     time_available = X_train.index < final_fit_cutoff
-    for target_index, target in enumerate(TARGET_COLS):
-        available = time_available & y_train[target].notna().to_numpy()
-        X_target = X_train.loc[available]
-        y_target = capacity_factor(y_train.loc[available, target], target)
-        if X_target.index.max() >= final_fit_cutoff:
-            raise RuntimeError("최종 학습 정답에 예측기준시점 이후 행이 포함됐습니다.")
-        for model_name in config.models:
-            iterations = iteration_schedule.get(model_name, {}).get(target)
-            LOGGER.info(
-                "최종 모델 고정 반복 학습 및 추론: %s / %s / iterations=%s",
-                model_name,
-                target,
-                iterations,
-            )
-            model = build_model(model_name, config, iterations=iterations)
-            model.fit(X_target, y_target)
-            arrays[model_name][:, target_index] = restore_generation(
-                model.predict(X_test), target
-            )
-            del model
-            gc.collect()
-    return _prediction_frames(arrays, X_test.index)
+    available = time_available & y_train[TARGET_COLS].notna().any(axis=1).to_numpy()
+    X_joint = X_train.loc[available]
+    y_joint = _capacity_factor_frame(y_train.loc[available])
+    if X_joint.index.max() >= final_fit_cutoff:
+        raise RuntimeError("최종 학습 정답에 예측기준시점 이후 행이 포함됐습니다.")
+    for model_name in config.models:
+        iterations = iteration_schedule.get(model_name, {}).get('multitask')
+        LOGGER.info(
+            "최종 multi-task 모델 학습 및 추론: %s / rows=%d / iterations=%s",
+            model_name,
+            len(X_joint),
+            iterations,
+        )
+        model = build_model(model_name, config, iterations=iterations)
+        model.fit(X_joint, y_joint)
+        predictions[model_name] = _restore_prediction_frame(
+            model.predict(X_test), X_test.index
+        )
+    return predictions
 
 
 def _monthly_evaluation(
@@ -167,7 +180,7 @@ def _build_masks(
 
 
 def run_pipeline(config: PipelineConfig) -> pd.DataFrame:
-    """누수 없는 평가부터 네 제출 파일 생성까지 실행한다."""
+    """누수 없는 평가부터 multi-task 제출 파일 생성까지 실행한다."""
     config.output_dir.mkdir(parents=True, exist_ok=True)
     if not config.models:
         raise ValueError("At least one model must be selected.")
