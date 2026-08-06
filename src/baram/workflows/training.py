@@ -49,9 +49,9 @@ def _all_history_masked_training_data(
     eligible_rows: np.ndarray | pd.Series | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Keep every historical row with at least one observed target."""
-    available = targets[TARGET_COLS].notna().any(axis=1).to_numpy()
+    available = targets[TARGET_COLS].notna().any(axis=1).to_numpy(copy=True)
     if eligible_rows is not None:
-        available &= np.asarray(eligible_rows, dtype=bool)
+        available = available & np.asarray(eligible_rows, dtype=bool)
     return (
         features.loc[available],
         _capacity_factor_frame(targets.loc[available]),

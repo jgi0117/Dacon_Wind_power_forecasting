@@ -57,6 +57,23 @@ class MultiTaskScalingTest(unittest.TestCase):
             selected_y.loc[index[0], 'kpx_group_1'], 0.5
         )
 
+    def test_read_only_eligible_mask_is_supported(self) -> None:
+        index = pd.date_range('2024-01-01', periods=2, freq='h')
+        features = pd.DataFrame({'x': [1.0, 2.0]}, index=index)
+        targets = pd.DataFrame(
+            [[10_800.0, 10_800.0, 10_500.0]] * 2,
+            index=index,
+            columns=TARGET_COLS,
+        )
+        eligible = np.array([True, False])
+        eligible.flags.writeable = False
+
+        selected_x, _ = _all_history_masked_training_data(
+            features, targets, eligible
+        )
+
+        self.assertEqual(list(selected_x.index), [index[0]])
+
     def test_capacity_factor_round_trip_and_shape(self) -> None:
         index = pd.date_range('2024-01-01', periods=2, freq='h')
         generation = pd.DataFrame(

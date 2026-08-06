@@ -61,7 +61,7 @@ Version 4는 하나의 RealMLP을 한 번 학습해 세 그룹을 동시에 예�
 현재 전략은 `all-history-masked`입니다. 2022년 행도 학습에 유지해 group 1·2가 shared trunk를 업데이트하고, 정답이 없는 group 3 head의 loss만 제외합니다. 세 타깃이 모두 결측인 행만 학습에서 제거합니다.
 
     .\scripts\setup_env.ps1
-    .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
+    .\scripts\run_models.ps1 -Models realmlp -Device cpu -EvaluationOnly -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
 
 Version 4 산출물은 기존 결과와 섞이지 않도록 다음 경로를 사용합니다.
 
@@ -117,14 +117,22 @@ LR 0.002는 가장 높은 validation score를 기록했지만 DACON score는 LR 
 
 ![LR 0.002 RealMLP train/validation loss](reports/v3/lr_0p002/figures/training_curves.png)
 
-## 6. Version 4 실험 계획
+## 6. Version 4 validation 결과
 
-Version 3의 세 설정은 DACON score 차이가 최대 0.005256으로 크지 않았고, 모두 train loss는 계속 감소하지만 validation loss는 0.4~0.5 부근에서 정체하거나 다시 상승했습니다. 독립 타깃 모델의 과적합과 타깃별 데이터 활용 한계를 Version 4의 핵심 문제로 봅니다.
+| 구조 | Validation score | 1-NMAE | FICR | 선택 epoch |
+|:---|---:|---:|---:|---:|
+| Version 3 독립 RealMLP, LR 0.02 | 0.650715 | 0.876935 | 0.424495 | 그룹별 64~81 |
+| Version 4 masked multi-task | 0.660839 | 0.880581 | 0.441097 | joint 45 |
 
-1. LR 0.02의 그룹별 독립 RealMLP 결과를 baseline으로 사용합니다.
-2. shared trunk와 세 개의 group head를 갖는 multi-task RealMLP을 구현합니다.
-3. 동일한 split, loss, scheduler, dropout, 200-epoch 조건으로 구조 변화만 비교합니다.
-4. 전체 점수뿐 아니라 그룹별 validation loss와 DACON 구성 지표를 비교합니다.
-5. train loss는 감소하지만 validation loss가 정체하는 현상이 완화되는지 확인합니다.
+Multi-task는 독립 학습보다 validation score가 0.010124 상승했습니다. 1-NMAE는 0.003646, FICR은 0.016602 상승해 전체적인 오차와 임계 구간 적중률이 모두 개선됐습니다. 특히 group 3는 NMAE가 0.142528에서 0.132280으로 감소하고 FICR이 0.357124에서 0.380157로 상승해 shared trunk의 이득이 가장 컸습니다.
 
-Version 4 결과는 아직 없습니다.
+| 구분 | 최저 validation loss (epoch) | 해당 epoch train loss | 마지막 train loss | 마지막 validation loss |
+|:---|---:|---:|---:|---:|
+| 전체 | 0.460531 (45) | 0.494379 | 0.097565 | 0.530212 |
+| group 1 | 0.424952 (49) | 0.500290 | 0.098784 | 0.534004 |
+| group 2 | 0.423536 (71) | 0.441630 | 0.090668 | 0.462054 |
+| group 3 | 0.486385 (19) | 0.658346 | 0.103243 | 0.594578 |
+
+Validation loss는 0.5에서 학습되지 않은 것이 아니라 전체 기준 epoch 45까지 0.460531로 감소한 뒤 다시 상승했습니다. 반면 train loss는 0.097565까지 계속 감소했으므로 주된 문제는 수렴 실패나 결측 mask가 아니라 과적합입니다. joint epoch 45 선택은 정상적으로 동작했습니다. 이번 실험은 validation 비교까지만 사용하며 submission은 생성하지 않습니다.
+
+![Version 4 multi-task train/validation loss](reports/v4/multitask_lr_0p02/figures/training_curves.png)

@@ -3,7 +3,7 @@
 Version 4 uses one shared-trunk RealMLP with three regression outputs in Python 3.13.
 
     .\scripts\setup_env.ps1
-    .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
+    .\scripts\run_models.ps1 -Models realmlp -Device cpu -EvaluationOnly -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
 
 The model uses an equal-weighted mean of the valid per-group FICR-aware losses.
 
