@@ -257,9 +257,11 @@ def _markdown_table(results: pd.DataFrame) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        '--runs-dir', type=Path, default=Path('model_outputs/v3/runs')
+        '--runs-dir', type=Path, default=Path('model_outputs/v3/lr_0p02/runs')
     )
-    parser.add_argument('--output-dir', type=Path, default=Path('reports/v3'))
+    parser.add_argument(
+        '--output-dir', type=Path, default=Path('reports/v3/lr_0p02')
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     runs_dir = args.runs_dir if args.runs_dir.is_absolute() else root / args.runs_dir

@@ -59,7 +59,7 @@ FICR 설정을 변경하는 예:
 
     .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs @('--max-epochs','200','--learning-rate','0.02','--ficr-weight','0.8','--ficr-temperature','0.008')
 
-실험 디렉터리의 v3/v4는 모델 버전이 아니라 실행 결과를 분리하기 위한 저장 경로입니다. 200-epoch LR 비교 전체를 Version 3 실험으로 취급합니다.
+실행 스크립트는 LR에 따라 `model_outputs/v3/lr_0p2`, `lr_0p02`, `lr_0p002`와 대응하는 `reports/v3` 하위 경로를 자동으로 선택합니다. 세 실행 모두 Version 3의 200-epoch LR 비교 실험입니다.
 
 - results.csv: validation 및 DACON 지표
 - group_metrics.csv: 타깃별 지표
@@ -76,9 +76,11 @@ Version 3는 RealMLP을 200 epoch까지 학습하면서 LR만 변경하는 실�
 |---:|---:|---:|---:|---:|:---|
 | 0.2 | 0.653255 | 0.631055 | 0.861265 | 0.400845 | 완료 |
 | 0.02 | 0.650715 | 0.625799 | 0.861005 | 0.390592 | 완료 |
-| 0.002 | - | - | - | - | 진행 중 |
+| 0.002 | 0.658018 | 0.630061 | 0.859115 | 0.401007 | 완료 |
 
 LR 0.02는 LR 0.2보다 DACON score가 0.005256 낮았습니다. 1-NMAE 차이는 0.000260에 불과하지만 FICR은 0.010253 낮아, 현재 점수 하락은 주로 임계 오차 구간을 반영하는 FICR에서 발생했습니다.
+
+LR 0.002는 가장 높은 validation score를 기록했지만 DACON score는 LR 0.2보다 0.000994 낮았습니다. FICR은 0.000162 높았으나 1-NMAE가 0.002150 낮아 최종 점수에서는 LR 0.2가 가장 좋았습니다. 따라서 이번 세 설정에서는 validation 순위와 DACON 순위가 일치하지 않습니다.
 
 ### Epoch별 train/validation loss
 
@@ -90,15 +92,22 @@ LR 0.02는 LR 0.2보다 DACON score가 0.005256 낮았습니다. 1-NMAE 차이�
 | 0.02 | kpx_group_1 | 0.418604 (66) | 0.524344 | 0.107267 |
 | 0.02 | kpx_group_2 | 0.429704 (64) | 0.459624 | 0.085195 |
 | 0.02 | kpx_group_3 | 0.479859 (81) | 0.564102 | 0.214852 |
+| 0.002 | kpx_group_1 | 0.417816 (152) | 0.459712 | 0.405072 |
+| 0.002 | kpx_group_2 | 0.432524 (159) | 0.451317 | 0.360022 |
+| 0.002 | kpx_group_3 | 0.493675 (180) | 0.499069 | 0.461288 |
 
-두 LR 모두 train loss가 마지막 epoch까지 감소하므로 수치적으로 발산하지는 않았습니다. 반면 validation loss는 최저점 이후 다시 상승합니다. 특히 LR 0.02는 더 낮은 train loss와 최저 validation loss를 기록했지만 최종 비교 구간과 DACON 성능은 낮아졌습니다. 이는 학습 실패보다는 과적합 및 epoch 선택 구간과 실제 평가 구간 사이의 일반화 차이로 해석합니다.
+세 LR 모두 train loss가 마지막 epoch까지 감소하므로 수치적으로 발산하지는 않았습니다. LR 0.2와 0.02는 validation loss가 비교적 이른 최저점 이후 다시 상승해 과적합이 나타납니다. LR 0.002는 train loss가 상대적으로 높고 최적 epoch가 152~180으로 늦어 수렴 속도가 느리지만, 200 epoch 안에서 validation loss 최저점에는 도달했습니다. 낮은 validation loss가 DACON 개선으로 이어지지 않은 점은 epoch 선택 구간과 실제 평가 구간 사이의 일반화 차이도 함께 봐야 함을 보여줍니다.
 
 #### LR 0.2
 
-![LR 0.2 RealMLP train/validation loss](reports/v2/figures/training_curves.png)
+![LR 0.2 RealMLP train/validation loss](reports/v3/lr_0p2/figures/training_curves.png)
 
 #### LR 0.02
 
-![LR 0.02 RealMLP train/validation loss](reports/v3/figures/training_curves.png)
+![LR 0.02 RealMLP train/validation loss](reports/v3/lr_0p02/figures/training_curves.png)
+
+#### LR 0.002
+
+![LR 0.002 RealMLP train/validation loss](reports/v3/lr_0p002/figures/training_curves.png)
 
 ## 6. 다음 단계
