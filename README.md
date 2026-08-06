@@ -1,6 +1,6 @@
-# DACON 풍력 발전량 예측 — Version 3
+# DACON 풍력 발전량 예측 — Version 4
 
-기상 예보 기반 풍력 발전량 예측 파이프라인입니다. Version 2 실험에서 가장 높은 validation 및 DACON 점수를 기록한 RealMLP을 최종 baseline으로 선정했습니다. Version 3는 학습 길이를 200 epoch로 늘린 RealMLP에서 learning rate에 따른 수렴과 일반화 성능 차이를 비교합니다.
+기상 예보 기반 풍력 발전량 예측 파이프라인입니다. Version 3에서 RealMLP을 200 epoch로 학습하며 LR 0.2, 0.02, 0.002를 비교했습니다. Version 4는 LR 0.02를 기준으로 세 발전 그룹을 함께 학습하는 multi-task learning을 실험합니다.
 
 - [Version 1 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v1.0.0): 5개 baseline 비교
 - [Version 2 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v2.0.0): FICR-aware 모델 비교와 RealMLP 선정
@@ -8,7 +8,7 @@
 
 ## 1. 프로젝트 개요
 
-기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개 그룹(kpx_group_1~3)을 예측하는 회귀 프로젝트입니다. Version 3에서 지원하는 모델은 RealMLP 하나뿐입니다.
+기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개 그룹(kpx_group_1~3)을 예측하는 회귀 프로젝트입니다. Version 4의 목표는 그룹별 독립 RealMLP을 shared trunk와 그룹별 prediction head를 갖는 하나의 multi-task 모델로 바꾸는 것입니다.
 
 평가식은 다음과 같습니다.
 
@@ -31,7 +31,7 @@
 
     .\.venv313\Scripts\python.exe preprocessing.py --data-dir data --output-dir artifacts --mode hybrid
 
-## 3. Version 3 학습 전략
+## 3. Version 4 학습 전략
 
 ### 시간 순 검증
 
@@ -39,37 +39,38 @@
 2. 경계에서 11시간을 purge합니다.
 3. 2024년 1~3월을 epoch 선택용 validation으로 사용합니다.
 4. 2024년 7~12월을 최종 비교 구간으로 유지합니다.
-5. 선택된 epoch로 각 타깃의 사용 가능한 전체 과거 데이터를 다시 학습해 테스트를 예측합니다.
+5. 선택된 epoch로 사용 가능한 전체 과거 데이터를 다시 학습해 테스트를 예측합니다.
 
-세 타깃은 독립적으로 학습합니다. 200 epoch를 모두 실행하고 FICR-aware validation loss가 가장 낮은 epoch를 최종 전체 데이터 재학습 길이로 사용합니다. RealMLP-TD 회귀의 tuned defaults를 기반으로 `lr_sched=coslog4`, dropout 0.15, Adam을 고정하고 LR 0.2, 0.02, 0.002를 비교합니다. Classical early stopping은 사용하지 않으며 validation은 최적 epoch 선택에만 사용합니다.
+하나의 shared trunk가 세 그룹의 공통 기상·시간 표현을 학습하고, 그룹별 prediction head가 각 발전량을 출력합니다. 특정 그룹의 타깃이 없는 행은 해당 그룹 loss에서만 제외하는 target mask를 사용합니다. 따라서 그룹 1 모델은 그룹 2·3의 정답을 직접 입력받지 않지만, shared trunk에 전달되는 gradient를 통해 다른 그룹의 학습 신호를 간접적으로 활용할 수 있습니다.
+
+Version 3에서 train loss 수렴이 가장 안정적이었던 LR 0.02를 기준값으로 고정합니다. 최대 200 epoch를 실행하고 세 그룹의 평균 validation loss가 가장 낮은 epoch를 최종 전체 데이터 재학습 길이로 사용합니다. Version 3와 동일하게 `lr_sched=coslog4`, dropout 0.15, Adam을 유지해 모델 구조 변화의 효과만 비교합니다.
 
 ### FICR-aware loss
 
-원래 FICR의 6%와 8% 오차 경계를 sigmoid로 근사한 soft-FICR을 사용합니다.
+각 그룹에 대해 FICR의 6%와 8% 오차 경계를 sigmoid로 근사한 soft-FICR을 사용합니다.
 
-    loss = 0.25 × smooth-MAE + 0.75 × (1-soft-FICR)
+    group_loss = 0.25 × smooth-MAE + 0.75 × (1-soft-FICR)
+    total_loss = mean(valid group losses)
 
-기본 FICR 비중은 0.75, sigmoid temperature는 0.01입니다. 각 epoch의 train loss, validation loss, competition score를 모두 기록합니다.
+기본 FICR 비중은 0.75, sigmoid temperature는 0.01입니다. 전체 loss와 함께 그룹별 train loss, validation loss, competition score를 기록해 한 그룹의 개선이 다른 그룹의 악화에 가려지지 않도록 합니다.
 
-## 4. 실행 방법
+## 4. 구현 및 산출물
 
-    .\scripts\setup_env.ps1
-    .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs @('--max-epochs','200','--learning-rate','0.02')
+Version 4 multi-task 학습 코드는 다음 구현 단계에서 추가합니다. 구현 전 현재 파이프라인을 실행하면 Version 3의 그룹별 독립 학습이 수행되므로, multi-task 결과로 취급하지 않습니다. Version 3 재현 방법은 [v3.0.0 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v3.0.0)에 보존되어 있습니다.
 
-FICR 설정을 변경하는 예:
+Version 4 산출물은 기존 결과와 섞이지 않도록 다음 경로를 사용합니다.
 
-    .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs @('--max-epochs','200','--learning-rate','0.02','--ficr-weight','0.8','--ficr-temperature','0.008')
+    model_outputs/v4/multitask_lr_0p02/
+    reports/v4/multitask_lr_0p02/
 
-실행 스크립트는 LR에 따라 `model_outputs/v3/lr_0p2`, `lr_0p02`, `lr_0p002`와 대응하는 `reports/v3` 하위 경로를 자동으로 선택합니다. 세 실행 모두 Version 3의 200-epoch LR 비교 실험입니다.
-
-- results.csv: validation 및 DACON 지표
+- results.csv: 전체 validation 및 DACON 지표
 - group_metrics.csv: 타깃별 지표
 - monthly_metrics.csv: 월별 지표
 - training_summary.csv: 최적 epoch와 학습 시간
-- training_history.csv: epoch별 train/validation loss와 score
-- figures/training_curves.png: RealMLP train/validation loss 변화
+- training_history.csv: epoch별 전체·그룹별 train/validation loss와 score
+- figures/training_curves.png: 전체·그룹별 train/validation loss 변화
 
-## 5. Version 3 LR 비교 결과
+## 5. Version 4 기준선: Version 3 LR 비교
 
 Version 3는 RealMLP을 200 epoch까지 학습하면서 LR만 변경하는 실험입니다. 아래 DACON 점수는 제출 화면의 값을 기록했습니다.
 
@@ -111,8 +112,14 @@ LR 0.002는 가장 높은 validation score를 기록했지만 DACON score는 LR 
 
 ![LR 0.002 RealMLP train/validation loss](reports/v3/lr_0p002/figures/training_curves.png)
 
-## 6. Version 3 결론
+## 6. Version 4 실험 계획
 
-Version 3의 범위는 RealMLP의 LR 0.2, 0.02, 0.002 비교로 마무리합니다. 세 설정의 DACON score 차이는 최대 0.005256으로 크지 않았고, 모든 설정에서 train loss는 계속 감소하지만 validation loss는 0.4~0.5 부근에서 정체하거나 다시 상승했습니다. 독립 타깃 모델의 과적합과 타깃별 데이터 활용 한계를 다음 실험의 핵심 문제로 봅니다.
+Version 3의 세 설정은 DACON score 차이가 최대 0.005256으로 크지 않았고, 모두 train loss는 계속 감소하지만 validation loss는 0.4~0.5 부근에서 정체하거나 다시 상승했습니다. 독립 타깃 모델의 과적합과 타깃별 데이터 활용 한계를 Version 4의 핵심 문제로 봅니다.
 
-DACON 최고점은 LR 0.2였지만, LR 0.02가 train loss를 가장 안정적으로 낮추면서 각 타깃의 validation 최저점도 LR 0.2보다 개선했습니다. 따라서 Version 4의 기준 LR은 0.02로 고정합니다. Version 4에서는 세 그룹을 함께 학습하고 그룹 간 공통 표현을 공유하는 multi-task learning을 검증합니다.
+1. LR 0.02의 그룹별 독립 RealMLP 결과를 baseline으로 사용합니다.
+2. shared trunk와 세 개의 group head를 갖는 multi-task RealMLP을 구현합니다.
+3. 동일한 split, loss, scheduler, dropout, 200-epoch 조건으로 구조 변화만 비교합니다.
+4. 전체 점수뿐 아니라 그룹별 validation loss와 DACON 구성 지표를 비교합니다.
+5. train loss는 감소하지만 validation loss가 정체하는 현상이 완화되는지 확인합니다.
+
+Version 4 결과는 아직 없습니다.
