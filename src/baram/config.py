@@ -27,7 +27,7 @@ class PipelineConfig:
     early_stopping_patience: int = 10
     early_stopping_min_delta: float = 1e-5
     batch_size: int = 256
-    learning_rate: float = 1e-4
+    learning_rate: float = 0.002
     ficr_weight: float = 0.75
     ficr_temperature: float = 0.01
     device: str | None = None
@@ -57,7 +57,7 @@ def parse_args() -> PipelineConfig:
     parser.add_argument('--early-stopping-patience', type=int, default=10)
     parser.add_argument('--early-stopping-min-delta', type=float, default=1e-5)
     parser.add_argument('--batch-size', type=int, default=256)
-    parser.add_argument('--learning-rate', type=float, default=1e-4)
+    parser.add_argument('--learning-rate', type=float, default=0.02)
     parser.add_argument('--ficr-weight', type=float, default=0.75)
     parser.add_argument('--ficr-temperature', type=float, default=0.01)
     parser.add_argument('--device', default=None, help='cpu, cuda, or omit for auto')

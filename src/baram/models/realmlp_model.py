@@ -18,6 +18,35 @@ from .base import RegressionModel
 LOGGER = logging.getLogger('baram.pipeline')
 _TRAIN_FICR_LOSS = 'baram_train_ficr_aware_loss'
 _VAL_FICR_LOSS = 'baram_val_ficr_aware_loss'
+_REALMLP_TD_REG_PARAMS = {
+    'hidden_sizes': [256] * 3,
+    'max_one_hot_cat_size': 9,
+    'embedding_size': 8,
+    'weight_param': 'ntk',
+    'weight_init_mode': 'std',
+    'bias_init_mode': 'he+5',
+    'bias_lr_factor': 0.1,
+    'act': 'mish',
+    'use_parametric_act': True,
+    'act_lr_factor': 0.1,
+    'wd': 2e-2,
+    'wd_sched': 'flat_cos',
+    'bias_wd_factor': 0.0,
+    'block_str': 'w-b-a-d',
+    'p_drop': 0.15,
+    'p_drop_sched': 'flat_cos',
+    'add_front_scale': True,
+    'scale_lr_factor': 6.0,
+    'tfms': ['one_hot', 'median_center', 'robust_scale', 'smooth_clip', 'embedding'],
+    'num_emb_type': 'pbld',
+    'plr_sigma': 0.1,
+    'plr_hidden_1': 16,
+    'plr_hidden_2': 4,
+    'plr_lr_factor': 0.1,
+    'clamp_output': True,
+    'opt': 'adam',
+    'sq_mom': 0.95,
+}
 
 
 def _competition_score_loss(y_pred: Any, y: Any) -> Any:
@@ -47,6 +76,7 @@ class RealMLPModel(RegressionModel):
         self.elapsed_seconds = 0.0
         self.device = 'cpu'
         self.n_threads = 1
+        self.early_stopping_enabled = False
         self.training_history: list[dict[str, float | int | None]] = []
 
     def fit(
@@ -96,6 +126,7 @@ class RealMLPModel(RegressionModel):
 
         Metrics.apply = staticmethod(score_aware_apply)
         has_validation = X_valid is not None and y_valid is not None
+        self.early_stopping_enabled = False
         fit_X_val = X_valid if has_validation else X.iloc[:min(512, len(X))]
         fit_y_val = y_valid if has_validation else y.iloc[:min(512, len(y))]
         fit_y = np.array(y.to_numpy(dtype=np.float32), copy=True)
@@ -107,11 +138,11 @@ class RealMLPModel(RegressionModel):
             n_threads=self.n_threads, n_epochs=self.epochs,
             batch_size=self.config.batch_size, n_cv=1, n_refit=0,
             n_ens=8, normalize_output=False,
+            lr=self.config.learning_rate, lr_sched='coslog4',
+            **_REALMLP_TD_REG_PARAMS,
             train_metric_name=_TRAIN_FICR_LOSS,
             val_metric_name=_VAL_FICR_LOSS,
-            use_early_stopping=has_validation,
-            early_stopping_additive_patience=self.epochs,
-            early_stopping_multiplicative_patience=1.0,
+            use_early_stopping=False,
             stop_epoch=None if has_validation else self.epochs,
             verbosity=2,
         )
@@ -155,6 +186,17 @@ class RealMLPModel(RegressionModel):
             'loss_name': 'ficr-aware', 'selection_metric': 'ficr-aware-loss',
             'ficr_weight': self.config.ficr_weight,
             'ficr_temperature': self.config.ficr_temperature,
+            'learning_rate': self.config.learning_rate,
+            'lr_schedule': 'coslog4',
+            'dropout': 0.15,
+            'dropout_schedule': 'flat_cos',
+            'weight_decay': 2e-2,
+            'weight_decay_schedule': 'flat_cos',
+            'optimizer': 'adam',
+            'squared_momentum': 0.95,
+            'weight_parameterization': 'ntk',
+            'target_normalization': False,
+            'early_stopping': self.early_stopping_enabled,
             'training_history': self.training_history,
             'device': self.device, 'n_threads': self.n_threads,
             'elapsed_seconds': self.elapsed_seconds,
