@@ -93,6 +93,7 @@ def ficr_aware_loss_torch(
     *,
     ficr_weight: float = 0.75,
     temperature: float = 0.01,
+    sample_weight: Any | None = None,
 ) -> Any:
     '''Masked soft-FICR loss with equal weighting across target groups.'''
     import torch
@@ -103,6 +104,12 @@ def ficr_aware_loss_torch(
         prediction = prediction.unsqueeze(0).expand_as(actual)
     if actual.shape != prediction.shape:
         actual = torch.broadcast_to(actual, prediction.shape)
+    if sample_weight is None:
+        sample_weight = torch.ones_like(actual)
+    elif sample_weight.ndim < actual.ndim:
+        sample_weight = sample_weight.unsqueeze(0).expand_as(actual)
+    elif sample_weight.shape != actual.shape:
+        sample_weight = torch.broadcast_to(sample_weight, actual.shape)
 
     if actual.ndim < 2:
         actual = actual.reshape(-1, 1)
@@ -113,30 +120,158 @@ def ficr_aware_loss_torch(
     safe_prediction = torch.where(valid, prediction, torch.zeros_like(prediction))
     smooth_error = torch.sqrt((safe_prediction - safe_actual).square() + 1e-8)
     valid_float = valid.to(smooth_error.dtype)
+    effective_weight = valid_float * sample_weight.clamp_min(0.0)
     sample_dim = -2
-    count = valid_float.sum(dim=sample_dim)
-    safe_count = count.clamp_min(1.0)
-    mae = (smooth_error * valid_float).sum(dim=sample_dim) / safe_count
-    mean_actual = (
-        (safe_actual * valid_float).sum(dim=sample_dim) / safe_count
-    ).clamp_min(1e-12)
-    normalized_weight = safe_actual / mean_actual.unsqueeze(sample_dim)
+    weight_sum = effective_weight.sum(dim=sample_dim)
+    safe_weight_sum = weight_sum.clamp_min(1e-12)
+    mae = (
+        (smooth_error * effective_weight).sum(dim=sample_dim)
+        / safe_weight_sum
+    )
     sigmoid_6 = torch.sigmoid((0.06 - smooth_error) / temperature)
     sigmoid_8 = torch.sigmoid((0.08 - smooth_error) / temperature)
-    soft_reward = normalized_weight * (3.0 * sigmoid_8 + sigmoid_6) / 4.0
-    soft_ficr = (
-        (soft_reward * valid_float).sum(dim=sample_dim) / safe_count
+    soft_reward = (3.0 * sigmoid_8 + sigmoid_6) / 4.0
+    actual_weight = safe_actual * effective_weight
+    soft_ficr = (soft_reward * actual_weight).sum(dim=sample_dim) / (
+        actual_weight.sum(dim=sample_dim).clamp_min(1e-12)
     )
     group_loss = (
         (1.0 - ficr_weight) * mae + ficr_weight * (1.0 - soft_ficr)
     )
-    valid_groups = count > 0
+    valid_groups = weight_sum > 0
     valid_group_count = valid_groups.sum(dim=-1).clamp_min(1)
     return (
         torch.where(valid_groups, group_loss, torch.zeros_like(group_loss))
         .sum(dim=-1)
         / valid_group_count
     )
+
+
+def relu_ficr_aware_loss_torch(
+    actual, prediction, ficr_weight=0.75, margin=0.005,
+):
+    '''Masked conservative ReLU-FICR loss with global smooth MAE.'''
+    import torch
+    import torch.nn.functional as functional
+
+    if actual.ndim < prediction.ndim:
+        actual = actual.unsqueeze(0).expand_as(prediction)
+    elif prediction.ndim < actual.ndim:
+        prediction = prediction.unsqueeze(0).expand_as(actual)
+    if actual.shape != prediction.shape:
+        actual = torch.broadcast_to(actual, prediction.shape)
+    if actual.ndim < 2:
+        actual = actual.reshape(-1, 1)
+        prediction = prediction.reshape(-1, 1)
+
+    valid = torch.isfinite(actual) & torch.isfinite(prediction) & (actual >= 0.10)
+    safe_actual = torch.where(valid, actual, torch.zeros_like(actual))
+    safe_prediction = torch.where(valid, prediction, torch.zeros_like(prediction))
+    smooth_error = torch.sqrt((safe_prediction - safe_actual).square() + 1e-8)
+    valid_float = valid.to(smooth_error.dtype)
+    count = valid_float.sum(dim=-2)
+    safe_count = count.clamp_min(1.0)
+    mae = (smooth_error * valid_float).sum(dim=-2) / safe_count
+    mean_actual = (
+        (safe_actual * valid_float).sum(dim=-2) / safe_count
+    ).clamp_min(1e-12)
+    normalized_weight = safe_actual / mean_actual.unsqueeze(-2)
+    hinge_6 = functional.relu(smooth_error - (0.06 - margin))
+    hinge_8 = functional.relu(smooth_error - (0.08 - margin))
+    relu_penalty = 0.25 * hinge_6 + 0.75 * hinge_8
+    weighted_penalty = (
+        relu_penalty * normalized_weight * valid_float
+    ).sum(dim=-2) / safe_count
+    group_loss = (
+        (1.0 - ficr_weight) * mae + ficr_weight * weighted_penalty
+    )
+    valid_groups = count > 0
+    return (
+        torch.where(valid_groups, group_loss, torch.zeros_like(group_loss))
+        .sum(dim=-1)
+        / valid_groups.sum(dim=-1).clamp_min(1)
+    )
+
+
+def temporal_group_dro_ficr_loss_torch(
+    actual, prediction, block_ids, block_weights,
+    ficr_weight=0.75, temperature=0.01,
+):
+    '''Combine global MAE with GroupDRO-weighted temporal soft-FICR.'''
+    import torch
+
+    ids = block_ids
+    while ids.ndim > 1:
+        ids = ids.squeeze(-1) if ids.shape[-1] == 1 else ids[0]
+    ids = ids.to(dtype=torch.long)
+    global_mae = ficr_aware_loss_torch(
+        actual, prediction, ficr_weight=0.0, temperature=temperature
+    )
+    block_losses = {}
+    for block_id in sorted(block_weights):
+        selected = ids == block_id
+        if bool(selected.any().item()):
+            block_losses[block_id] = ficr_aware_loss_torch(
+                actual[..., selected, :], prediction[..., selected, :],
+                ficr_weight=1.0, temperature=temperature,
+            )
+    if not block_losses:
+        fallback = ficr_aware_loss_torch(
+            actual, prediction, ficr_weight=ficr_weight,
+            temperature=temperature,
+        )
+        return fallback, {}
+    weight_sum = sum(block_weights[key] for key in block_losses)
+    robust_ficr = sum(
+        block_losses[key] * (block_weights[key] / weight_sum)
+        for key in block_losses
+    )
+    loss = (1.0 - ficr_weight) * global_mae + ficr_weight * robust_ficr
+    return loss, block_losses
+
+
+def ficr_boundary_consistency_loss_torch(
+    actual, prediction, temperature=0.01,
+):
+    '''Penalize ensemble disagreement in the soft 6%/8% FICR decisions.'''
+    import torch
+
+    if prediction.ndim < 3 or prediction.shape[0] < 2:
+        return ficr_aware_loss_torch(
+            actual, prediction, ficr_weight=0.0, temperature=temperature
+        ) * 0.0
+    if actual.ndim < prediction.ndim:
+        actual = actual.unsqueeze(0).expand_as(prediction)
+    elif actual.shape != prediction.shape:
+        actual = torch.broadcast_to(actual, prediction.shape)
+    valid = torch.isfinite(actual) & torch.isfinite(prediction) & (actual >= 0.10)
+    safe_actual = torch.where(valid, actual, torch.zeros_like(actual))
+    safe_prediction = torch.where(valid, prediction, torch.zeros_like(prediction))
+    error = (safe_prediction - safe_actual).abs()
+    soft_6 = torch.sigmoid((0.06 - error) / temperature)
+    soft_8 = torch.sigmoid((0.08 - error) / temperature)
+    soft_reward = (3.0 * soft_8 + soft_6) / 4.0
+    reward_variance = soft_reward.var(dim=0, unbiased=False)
+
+    mean_error = error.mean(dim=0)
+    mean_6 = torch.sigmoid((0.06 - mean_error) / temperature)
+    mean_8 = torch.sigmoid((0.08 - mean_error) / temperature)
+    attention = torch.maximum(
+        4.0 * mean_6 * (1.0 - mean_6),
+        4.0 * mean_8 * (1.0 - mean_8),
+    ).detach()
+    base_actual = safe_actual[0]
+    base_valid = valid.all(dim=0).to(reward_variance.dtype)
+    boundary_weight = base_actual * attention * base_valid
+    denominator = boundary_weight.sum(dim=-2)
+    group_loss = (
+        reward_variance * boundary_weight
+    ).sum(dim=-2) / denominator.clamp_min(1e-12)
+    valid_groups = denominator > 0.0
+    scalar = torch.where(
+        valid_groups, group_loss, torch.zeros_like(group_loss)
+    ).sum(dim=-1) / valid_groups.sum(dim=-1).clamp_min(1)
+    return scalar.expand(prediction.shape[0])
 
 
 def activity_loss_torch(actual: Any, logits: Any) -> Any:

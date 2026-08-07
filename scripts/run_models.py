@@ -1,4 +1,4 @@
-'''Run Version 4 multi-task models in the project Python environment.'''
+'''Run Version 5 experiments with the original RealMLP structure.'''
 
 from __future__ import annotations
 
@@ -38,18 +38,66 @@ def _run_complete(run_dir: Path, model: str, evaluation_only: bool) -> bool:
 
 def _experiment_name(pipeline_args: list[str]) -> str:
     learning_rate = '0.02'
+    ficr_loss = 'sigmoid'
+    relu_margin = '0.005'
+    group_dro = False
+    group3_reliability = False
+    group3_stacking = False
+    consistency_weight = '0.0'
     for index, argument in enumerate(pipeline_args):
         if argument == '--learning-rate' and index + 1 < len(pipeline_args):
             learning_rate = pipeline_args[index + 1]
         elif argument.startswith('--learning-rate='):
             learning_rate = argument.split('=', 1)[1]
+        elif argument == '--ficr-loss' and index + 1 < len(pipeline_args):
+            ficr_loss = pipeline_args[index + 1]
+        elif argument.startswith('--ficr-loss='):
+            ficr_loss = argument.split('=', 1)[1]
+        elif (
+            argument == '--ficr-relu-margin'
+            and index + 1 < len(pipeline_args)
+        ):
+            relu_margin = pipeline_args[index + 1]
+        elif argument.startswith('--ficr-relu-margin='):
+            relu_margin = argument.split('=', 1)[1]
+        elif argument == '--temporal-group-dro':
+            group_dro = True
+        elif argument == '--enable-group3-reliability-weighting':
+            group3_reliability = True
+        elif argument == '--disable-group3-stacking':
+            group3_stacking = False
+        elif (
+            argument == '--ficr-boundary-consistency-weight'
+            and index + 1 < len(pipeline_args)
+        ):
+            consistency_weight = pipeline_args[index + 1]
+        elif argument.startswith('--ficr-boundary-consistency-weight='):
+            consistency_weight = argument.split('=', 1)[1]
     normalized = format(float(learning_rate), 'g').replace('.', 'p')
-    return f'activity_aux_lr_{normalized}'
+    normalized_consistency = format(
+        float(consistency_weight), 'g'
+    ).replace('.', 'p')
+    normalized_margin = format(float(relu_margin), 'g').replace('.', 'p')
+    if not group3_stacking and ficr_loss == 'sigmoid':
+        prefix = 'temporal_oof_correction'
+    elif group3_stacking and ficr_loss == 'sigmoid':
+        prefix = 'group3_stacked_sigmoid'
+    elif group3_reliability and ficr_loss == 'sigmoid':
+        prefix = 'group3_reliability_sigmoid'
+    elif ficr_loss == 'relu':
+        prefix = f'relu_ficr_margin_{normalized_margin}'
+    elif group_dro:
+        prefix = 'temporal_group_dro'
+    elif float(consistency_weight) > 0.0:
+        prefix = f'ficr_boundary_consistency_w_{normalized_consistency}'
+    else:
+        prefix = 'realmlp_activity'
+    return f'{prefix}_lr_{normalized}'
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='Train Version 4 multi-task models in one environment.'
+        description='Train Version 5 with the original RealMLP structure.'
     )
     parser.add_argument(
         '--models', nargs='+', required=True,
@@ -86,9 +134,9 @@ def main() -> None:
         extra_args = extra_args[1:]
     experiment_name = _experiment_name(extra_args)
     runs_dir_arg = args.runs_dir or (
-        Path('model_outputs/v4') / experiment_name / 'runs'
+        Path('model_outputs/v5') / experiment_name / 'runs'
     )
-    report_dir_arg = args.report_dir or Path('reports/v4') / experiment_name
+    report_dir_arg = args.report_dir or Path('reports/v5') / experiment_name
     runs_dir = (repo_root / runs_dir_arg).resolve()
 
     for model in models:

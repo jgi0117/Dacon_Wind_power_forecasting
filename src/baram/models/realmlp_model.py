@@ -11,7 +11,15 @@ import numpy as np
 import pandas as pd
 
 from baram.config import PipelineConfig
-from baram.metrics import TARGET_COLS, activity_loss_torch, ficr_aware_loss_torch
+from baram.metrics import (
+    TARGET_COLS,
+    activity_loss_torch,
+    ficr_boundary_consistency_loss_torch,
+    ficr_aware_loss_torch,
+    relu_ficr_aware_loss_torch,
+    temporal_group_dro_ficr_loss_torch,
+)
+from baram.reliability import group3_cross_fitted_reliability
 from .base import RegressionModel
 
 
@@ -19,6 +27,7 @@ LOGGER = logging.getLogger('baram.pipeline')
 _TRAIN_FICR_LOSS = 'baram_train_ficr_aware_loss'
 _VAL_FICR_LOSS = 'baram_val_ficr_aware_loss'
 _MISSING_TARGET = -1.0
+_ACTIVITY_CODES_PER_BLOCK = 3
 _REALMLP_TD_REG_PARAMS = {
     'hidden_sizes': [256] * 3,
     'max_one_hot_cat_size': 9,
@@ -50,6 +59,65 @@ _REALMLP_TD_REG_PARAMS = {
     'opt': 'adam',
     'sq_mom': 0.95,
 }
+
+
+def _quarter_block_ids(index: pd.Index):
+    '''Return compact chronological quarter IDs for loss-only metadata.'''
+    timestamps = pd.DatetimeIndex(index)
+    quarter_keys = timestamps.year.astype(np.int64) * 4 + timestamps.quarter - 1
+    unique_keys = sorted(np.unique(quarter_keys).tolist())
+    key_to_id = {key: block_id for block_id, key in enumerate(unique_keys)}
+    ids = np.asarray(
+        [key_to_id[int(key)] for key in quarter_keys], dtype=np.float32
+    )
+    labels = {
+        block_id: f'{key // 4}Q{key % 4 + 1}'
+        for key, block_id in key_to_id.items()
+    }
+    return ids, labels
+
+
+def _pack_activity_block_metadata(activity, block_ids):
+    '''Pack block ID into the first activity label without adding an output.'''
+    packed = np.array(activity, dtype=np.float32, copy=True)
+    first_code = np.where(
+        packed[:, 0] < 0.0, 2.0, packed[:, 0]
+    ).astype(np.float32)
+    packed[:, 0] = _ACTIVITY_CODES_PER_BLOCK * block_ids + first_code
+    return packed
+
+
+def _unpack_activity_block_metadata(packed):
+    '''Decode original activity labels and temporal IDs inside the loss.'''
+    import torch
+
+    encoded = packed[..., 0]
+    block_ids = torch.div(
+        encoded, _ACTIVITY_CODES_PER_BLOCK, rounding_mode='floor'
+    )
+    first_code = torch.remainder(encoded, _ACTIVITY_CODES_PER_BLOCK)
+    activity = packed.clone()
+    activity[..., 0] = torch.where(
+        first_code == 2.0,
+        torch.full_like(first_code, _MISSING_TARGET),
+        first_code,
+    )
+    return activity, block_ids
+
+
+def _pack_reliability_metadata(activity, reliability):
+    '''Pack continuous per-target weights into activity target fractions.'''
+    integer_codes = np.where(activity < 0.0, 2.0, activity).astype(np.float32)
+    return integer_codes + 0.1 * np.asarray(reliability, dtype=np.float32)
+
+
+def _unpack_reliability_metadata(packed):
+    '''Recover activity codes and continuous reliability weights in the loss.'''
+    import torch
+
+    integer_codes = torch.floor(packed + 1e-5)
+    reliability = ((packed - integer_codes) * 10.0).clamp(0.0, 1.0)
+    return integer_codes, reliability
 
 
 def _competition_score_loss(y_pred: Any, y: Any) -> Any:
@@ -91,6 +159,38 @@ def _competition_score_loss(y_pred: Any, y: Any) -> Any:
     return -score
 
 
+def _competition_components(y_pred: Any, y: Any) -> tuple[Any, Any]:
+    '''Return exact group-averaged NMAE and FICR tensors.'''
+    import torch
+
+    prediction = y_pred
+    actual = y
+    if actual.ndim < prediction.ndim:
+        actual = actual.unsqueeze(0).expand_as(prediction)
+    elif prediction.ndim < actual.ndim:
+        prediction = prediction.unsqueeze(0).expand_as(actual)
+    valid = torch.isfinite(actual) & torch.isfinite(prediction) & (actual >= 0.10)
+    safe_actual = torch.where(valid, actual, torch.zeros_like(actual))
+    safe_prediction = torch.where(
+        valid, prediction.clamp(0.0, 1.0), torch.zeros_like(prediction)
+    )
+    error = (safe_prediction - safe_actual).abs()
+    valid_float = valid.to(error.dtype)
+    count = valid_float.sum(dim=-2)
+    nmae = (error * valid_float).sum(dim=-2) / count.clamp_min(1.0)
+    unit_price = torch.where(
+        error <= 0.06, 4.0, torch.where(error <= 0.08, 3.0, 0.0)
+    )
+    ficr = (safe_actual * unit_price * valid_float).sum(dim=-2) / (
+        safe_actual * 4.0 * valid_float
+    ).sum(dim=-2).clamp_min(1e-12)
+    valid_groups = count > 0
+    divisor = valid_groups.sum(dim=-1).clamp_min(1)
+    mean_nmae = torch.where(valid_groups, nmae, 0.0).sum(dim=-1) / divisor
+    mean_ficr = torch.where(valid_groups, ficr, 0.0).sum(dim=-1) / divisor
+    return mean_nmae, mean_ficr
+
+
 class RealMLPModel(RegressionModel):
     def __init__(self, config: PipelineConfig, epochs: int | None = None) -> None:
         self.config = config
@@ -103,6 +203,8 @@ class RealMLPModel(RegressionModel):
         self.early_stopping_enabled = False
         self.training_history: list[dict[str, Any]] = []
         self.target_names = list(TARGET_COLS)
+        self.temporal_block_weights: dict[str, float] = {}
+        self.group3_reliability_metadata: dict[str, Any] = {}
 
     def fit(
         self, X: pd.DataFrame, y: pd.DataFrame | pd.Series,
@@ -123,44 +225,128 @@ class RealMLPModel(RegressionModel):
         epoch_train_losses: list[float] = []
         epoch_objective_train_losses: list[float] = []
         epoch_activity_train_losses: list[float] = []
+        epoch_boundary_consistency_losses: list[float] = []
         epoch_group_train_losses: dict[str, list[float]] = {}
         if isinstance(y, pd.DataFrame):
             self.target_names = [str(column) for column in y.columns]
         else:
             self.target_names = [str(y.name or TARGET_COLS[0])]
         epoch_group_train_losses = {target: [] for target in self.target_names}
+        block_ids, temporal_block_labels = _quarter_block_ids(X.index)
+        dro_log_weights = {key: 0.0 for key in temporal_block_labels}
+        epoch_temporal_losses = {
+            key: [] for key in temporal_block_labels
+        }
+
+        def normalized_dro_weights() -> dict[int, float]:
+            maximum = max(dro_log_weights.values())
+            unscaled = {
+                key: float(np.exp(value - maximum))
+                for key, value in dro_log_weights.items()
+            }
+            total = sum(unscaled.values())
+            return {key: value / total for key, value in unscaled.items()}
+
+        def capacity_objective(
+            actual: Any, prediction: Any, reliability: Any | None = None
+        ) -> Any:
+            if self.config.ficr_loss == 'relu':
+                return relu_ficr_aware_loss_torch(
+                    actual,
+                    prediction,
+                    ficr_weight=self.config.ficr_weight,
+                    margin=self.config.ficr_relu_margin,
+                )
+            return ficr_aware_loss_torch(
+                actual,
+                prediction,
+                ficr_weight=self.config.ficr_weight,
+                temperature=self.config.ficr_temperature,
+                sample_weight=reliability,
+            )
 
         def score_aware_apply(y_pred: Any, actual: Any, metric_name: str) -> Any:
+            import torch
+
             if metric_name in {_TRAIN_FICR_LOSS, _VAL_FICR_LOSS}:
                 n_targets = len(self.target_names)
                 actual_capacity = actual[..., :n_targets]
                 predicted_capacity = y_pred[..., :n_targets]
-                actual_activity = actual[..., n_targets:]
-                predicted_activity = y_pred[..., n_targets:]
-                capacity_loss = ficr_aware_loss_torch(
-                    actual_capacity, predicted_capacity,
-                    ficr_weight=self.config.ficr_weight,
-                    temperature=self.config.ficr_temperature,
+                actual_activity = actual[..., n_targets:2 * n_targets]
+                predicted_activity = y_pred[..., n_targets:2 * n_targets]
+                reliability = None
+                if self.config.group3_reliability_weighting:
+                    actual_activity, reliability = (
+                        _unpack_reliability_metadata(actual_activity)
+                    )
+                actual_blocks = None
+                if self.config.temporal_group_dro:
+                    actual_activity, actual_blocks = (
+                        _unpack_activity_block_metadata(actual_activity)
+                    )
+                actual_activity = torch.where(
+                    actual_activity == 2.0,
+                    torch.full_like(actual_activity, _MISSING_TARGET),
+                    actual_activity,
                 )
+                temporal_losses = {}
+                use_dro = (
+                    metric_name == _TRAIN_FICR_LOSS
+                    and self.config.temporal_group_dro
+                    and self.config.ficr_loss == 'sigmoid'
+                )
+                if use_dro:
+                    capacity_loss, temporal_losses = (
+                        temporal_group_dro_ficr_loss_torch(
+                            actual_capacity,
+                            predicted_capacity,
+                            actual_blocks,
+                            normalized_dro_weights(),
+                            ficr_weight=self.config.ficr_weight,
+                            temperature=self.config.ficr_temperature,
+                        )
+                    )
+                else:
+                    capacity_loss = capacity_objective(
+                        actual_capacity, predicted_capacity, reliability
+                    )
                 activity_loss = activity_loss_torch(
                     actual_activity, predicted_activity
                 )
+                boundary_consistency_loss = capacity_loss * 0.0
+                if (
+                    metric_name == _TRAIN_FICR_LOSS
+                    and self.config.ficr_boundary_consistency_weight > 0.0
+                ):
+                    boundary_consistency_loss = (
+                        ficr_boundary_consistency_loss_torch(
+                            actual_capacity,
+                            predicted_capacity,
+                            temperature=self.config.ficr_temperature,
+                        )
+                    )
                 value = (
                     capacity_loss
                     + self.config.activity_loss_weight * activity_loss
+                    + self.config.ficr_boundary_consistency_weight
+                    * boundary_consistency_loss
                     if metric_name == _TRAIN_FICR_LOSS
                     else capacity_loss
                 )
                 mean_loss = float(value.detach().mean().cpu())
                 mean_capacity_loss = float(capacity_loss.detach().mean().cpu())
                 mean_activity_loss = float(activity_loss.detach().mean().cpu())
+                mean_boundary_loss = float(
+                    boundary_consistency_loss.detach().mean().cpu()
+                )
                 group_losses = {
                     target: float(
-                        ficr_aware_loss_torch(
+                        capacity_objective(
                             actual_capacity[..., index:index + 1],
                             predicted_capacity[..., index:index + 1],
-                            ficr_weight=self.config.ficr_weight,
-                            temperature=self.config.ficr_temperature,
+                            None if reliability is None else reliability[
+                                ..., index:index + 1
+                            ],
                         ).detach().mean().cpu()
                     )
                     for index, target in enumerate(self.target_names)
@@ -169,10 +355,19 @@ class RealMLPModel(RegressionModel):
                     epoch_train_losses.append(mean_capacity_loss)
                     epoch_objective_train_losses.append(mean_loss)
                     epoch_activity_train_losses.append(mean_activity_loss)
+                    epoch_boundary_consistency_losses.append(
+                        mean_boundary_loss
+                    )
                     for target, loss in group_losses.items():
                         epoch_group_train_losses[target].append(loss)
+                    for block_id, block_loss in temporal_losses.items():
+                        scalar_loss = float(block_loss.detach().mean().cpu())
+                        epoch_temporal_losses[block_id].append(scalar_loss)
                     return value
                 score_value = _competition_score_loss(
+                    predicted_capacity, actual_capacity
+                )
+                validation_nmae, validation_ficr = _competition_components(
                     predicted_capacity, actual_capacity
                 )
                 history: dict[str, Any] = {
@@ -185,6 +380,12 @@ class RealMLPModel(RegressionModel):
                     'validation_score': -float(
                         score_value.detach().mean().cpu()
                     ),
+                    'validation_nmae': float(
+                        validation_nmae.detach().mean().cpu()
+                    ),
+                    'validation_ficr': float(
+                        validation_ficr.detach().mean().cpu()
+                    ),
                     'training_objective_loss': (
                         float(np.mean(epoch_objective_train_losses))
                         if epoch_objective_train_losses else None
@@ -194,6 +395,11 @@ class RealMLPModel(RegressionModel):
                         if epoch_activity_train_losses else None
                     ),
                     'activity_validation_loss': mean_activity_loss,
+                    'boundary_consistency_train_loss': (
+                        float(np.mean(epoch_boundary_consistency_losses))
+                        if epoch_boundary_consistency_losses else None
+                    ),
+                    'boundary_consistency_validation_loss': None,
                 }
                 for index, target in enumerate(self.target_names):
                     train_losses = epoch_group_train_losses[target]
@@ -205,14 +411,47 @@ class RealMLPModel(RegressionModel):
                         predicted_capacity[..., index:index + 1],
                         actual_capacity[..., index:index + 1],
                     )
+                    group_nmae, group_ficr = _competition_components(
+                        predicted_capacity[..., index:index + 1],
+                        actual_capacity[..., index:index + 1],
+                    )
                     history[f'{target}__validation_score'] = -float(
                         group_score.detach().mean().cpu()
                     )
+                    history[f'{target}__validation_nmae'] = float(
+                        group_nmae.detach().mean().cpu()
+                    )
+                    history[f'{target}__validation_ficr'] = float(
+                        group_ficr.detach().mean().cpu()
+                    )
+                if self.config.temporal_group_dro:
+                    for block_id, losses in epoch_temporal_losses.items():
+                        if losses:
+                            dro_log_weights[block_id] += (
+                                self.config.temporal_group_dro_eta
+                                * float(np.mean(losses))
+                            )
+                    offset = max(dro_log_weights.values())
+                    for block_id in dro_log_weights:
+                        dro_log_weights[block_id] -= offset
+                if self.config.temporal_group_dro:
+                    dro_weights = normalized_dro_weights()
+                    for block_id, label in temporal_block_labels.items():
+                        losses = epoch_temporal_losses[block_id]
+                        history[f'temporal_{label}__train_ficr_loss'] = (
+                            float(np.mean(losses)) if losses else None
+                        )
+                        history[f'temporal_{label}__dro_weight'] = (
+                            dro_weights[block_id]
+                        )
                 self.training_history.append(history)
                 epoch_train_losses.clear()
                 epoch_objective_train_losses.clear()
                 epoch_activity_train_losses.clear()
+                epoch_boundary_consistency_losses.clear()
                 for losses in epoch_group_train_losses.values():
+                    losses.clear()
+                for losses in epoch_temporal_losses.values():
                     losses.clear()
                 return value
             return original_apply(y_pred, actual, metric_name)
@@ -235,11 +474,46 @@ class RealMLPModel(RegressionModel):
         activity_y_val = np.where(
             observed_y_val, capacity_y_val >= 0.10, _MISSING_TARGET
         ).astype(np.float32)
+        if self.config.group3_reliability_weighting:
+            reliability_y, self.group3_reliability_metadata = (
+                group3_cross_fitted_reliability(
+                    X,
+                    y,
+                    min_weight=self.config.group3_reliability_min_weight,
+                    seed=self.config.seed,
+                )
+            )
+            LOGGER.info(
+                'Group 3 cross-fitted reliability: %s',
+                self.group3_reliability_metadata,
+            )
+        else:
+            reliability_y = np.ones_like(capacity_y, dtype=np.float32)
+            self.group3_reliability_metadata = {
+                'enabled': False, 'reason': 'disabled by configuration'
+            }
+        reliability_y_val = np.ones_like(capacity_y_val, dtype=np.float32)
         capacity_y[~observed_y] = _MISSING_TARGET
         capacity_y_val[~observed_y_val] = _MISSING_TARGET
-        fit_y = np.concatenate([capacity_y, activity_y], axis=1)
+        validation_block_ids, _ = _quarter_block_ids(fit_X_val.index)
+        packed_activity_y = (
+            _pack_activity_block_metadata(activity_y, block_ids)
+            if self.config.temporal_group_dro else activity_y
+        )
+        packed_activity_y_val = (
+            _pack_activity_block_metadata(activity_y_val, validation_block_ids)
+            if self.config.temporal_group_dro else activity_y_val
+        )
+        if self.config.group3_reliability_weighting:
+            packed_activity_y = _pack_reliability_metadata(
+                packed_activity_y, reliability_y
+            )
+            packed_activity_y_val = _pack_reliability_metadata(
+                packed_activity_y_val, reliability_y_val
+            )
+        fit_y = np.concatenate([capacity_y, packed_activity_y], axis=1)
         fit_y_val_array = np.concatenate(
-            [capacity_y_val, activity_y_val], axis=1
+            [capacity_y_val, packed_activity_y_val], axis=1
         )
         self.model = RealMLP_TD_Regressor(
             device=self.device, random_state=self.config.seed,
@@ -254,12 +528,21 @@ class RealMLPModel(RegressionModel):
             stop_epoch=None if has_validation else self.epochs,
             verbosity=2,
         )
+
         try:
             self.model.fit(
                 X, fit_y, X_val=fit_X_val, y_val=fit_y_val_array
             )
         finally:
             Metrics.apply = staticmethod(original_apply)
+        if self.config.temporal_group_dro:
+            final_dro_weights = normalized_dro_weights()
+            self.temporal_block_weights = {
+                temporal_block_labels[key]: final_dro_weights[key]
+                for key in temporal_block_labels
+            }
+        else:
+            self.temporal_block_weights = {}
         self.best_iteration = self._read_best_iteration()
         self.elapsed_seconds = time.perf_counter() - started
         LOGGER.info('RealMLP best epoch=%d', self.best_iteration)
@@ -295,9 +578,34 @@ class RealMLPModel(RegressionModel):
             'targets': self.target_names,
             'max_epochs': self.epochs, 'best_iteration': self.best_iteration,
             'validation_metric': 'ficr-aware-loss', 'n_ens': 8,
-            'loss_name': 'ficr-aware', 'selection_metric': 'ficr-aware-loss',
+            'loss_name': f'{self.config.ficr_loss}-ficr-aware',
+            'selection_metric': f'{self.config.ficr_loss}-ficr-aware-loss',
             'ficr_weight': self.config.ficr_weight,
             'ficr_temperature': self.config.ficr_temperature,
+            'ficr_loss': self.config.ficr_loss,
+            'ficr_relu_margin': self.config.ficr_relu_margin,
+            'ficr_relu_thresholds': [
+                0.06 - self.config.ficr_relu_margin,
+                0.08 - self.config.ficr_relu_margin,
+            ],
+            'ficr_boundary_consistency_weight': (
+                self.config.ficr_boundary_consistency_weight
+            ),
+            'ficr_boundary_consistency': 'internal-ensemble-soft-reward-variance',
+            'temporal_group_dro': self.config.temporal_group_dro,
+            'temporal_group_dro_eta': self.config.temporal_group_dro_eta,
+            'temporal_blocks': 'calendar-quarter',
+            'temporal_block_weights': self.temporal_block_weights,
+            'temporal_metadata_transport': 'packed-first-activity-target',
+            'group3_reliability_weighting': (
+                self.config.group3_reliability_weighting
+            ),
+            'group3_reliability_min_weight': (
+                self.config.group3_reliability_min_weight
+            ),
+            'group3_reliability': self.group3_reliability_metadata,
+            'group3_reliability_scope': 'capacity-loss-only',
+            'group3_reliability_validation_weights': 'all-one',
             'activity_loss_weight': self.config.activity_loss_weight,
             'activity_threshold': 0.10,
             'learning_rate': self.config.learning_rate,

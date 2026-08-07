@@ -1,0 +1,4 @@
+model,target,n_fit_rows,best_iteration,max_training_length,loss_name,selection_metric,elapsed_seconds
+realmlp,kpx_group_1,17411,65,200,sigmoid-ficr-aware,sigmoid-ficr-aware-loss,3179.6078324001282
+realmlp,kpx_group_2,17412,65,200,sigmoid-ficr-aware,sigmoid-ficr-aware-loss,3179.6078324001282
+realmlp,kpx_group_3,8749,65,200,sigmoid-ficr-aware,sigmoid-ficr-aware-loss,3179.6078324001282

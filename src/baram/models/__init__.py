@@ -15,11 +15,26 @@ def build_model(
     name: str,
     config: PipelineConfig,
     *,
-    iterations: int | None = None,
+    iterations: dict[str, int] | int | None = None,
 ) -> RegressionModel:
     if name == 'realmlp':
+        if config.group3_stacking:
+            from .stacked_realmlp_model import StackedGroup3RealMLPModel
+            return StackedGroup3RealMLPModel(config, iterations=iterations)
+        if config.temporal_prediction_correction:
+            from .temporal_correction_model import (
+                TemporalCorrectionRealMLPModel,
+            )
+            return TemporalCorrectionRealMLPModel(
+                config, iterations=iterations
+            )
         from .realmlp_model import RealMLPModel
-        return RealMLPModel(config, epochs=iterations)
+        epochs = (
+            iterations.get('multitask')
+            if isinstance(iterations, dict)
+            else iterations
+        )
+        return RealMLPModel(config, epochs=epochs)
     raise ValueError(f'Unsupported model: {name}')
 
 

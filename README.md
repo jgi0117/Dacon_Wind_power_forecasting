@@ -1,14 +1,15 @@
-# DACON 풍력 발전량 예측 — Version 4
+# DACON 풍력 발전량 예측 — Version 5
 
-기상 예보 기반 풍력 발전량 예측 파이프라인입니다. Version 3에서 RealMLP을 200 epoch로 학습하며 LR 0.2, 0.02, 0.002를 비교했습니다. Version 4는 LR 0.02의 multi-task RealMLP에 activity auxiliary objective를 추가해 저출력 관측도 학습 신호로 사용합니다.
+기상 예보 기반 풍력 발전량 예측 파이프라인입니다. Version 4는 multi-task RealMLP에 activity auxiliary objective를 추가해 소폭 개선했습니다. Version 5는 공식 RealMLP 구조를 유지한 상태에서 과적합 해결 방법을 검토합니다.
 
 - [Version 1 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v1.0.0): 5개 baseline 비교
 - [Version 2 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v2.0.0): FICR-aware 모델 비교와 RealMLP 선정
 - [Version 3 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v3.0.0): RealMLP 200-epoch learning-rate 비교
+- [Version 4 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v4.0.0): multi-task activity auxiliary objective
 
 ## 1. 프로젝트 개요
 
-기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개 그룹(kpx_group_1~3)을 예측하는 회귀 프로젝트입니다. Version 4의 목표는 그룹별 독립 RealMLP을 shared trunk와 그룹별 prediction head를 갖는 하나의 multi-task 모델로 바꾸는 것입니다.
+기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개 그룹(kpx_group_1~3)을 예측하는 회귀 프로젝트입니다. Version 5는 PyTabKit RealMLP의 hidden layer, optimizer, scheduler와 ensemble 구조를 변경하지 않습니다.
 
 평가식은 다음과 같습니다.
 
@@ -62,19 +63,38 @@ Version 3에서 train loss 수렴이 가장 안정적이었던 LR 0.02를 기준
 
 결측 타깃은 `-1` sentinel로 분리하며 activity BCE는 결측을 제외한 실제 0 및 저출력 관측에도 적용합니다. best epoch는 기존 FICR-aware capacity validation loss로만 선택하고, submission에는 세 capacity 출력만 사용합니다.
 
-## 4. 구현 및 산출물
+## 4. Version 5 구현 및 산출물
 
-Version 4는 하나의 RealMLP을 한 번 학습해 세 그룹의 capacity와 activity를 동시에 학습합니다. Version 3의 그룹별 독립 학습 코드는 [v3.0.0 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v3.0.0)에 보존되어 있습니다.
+시간 domain-adversarial, latent regime mixture와 24시간 temporal encoder/decoder는 제거했습니다. 현재 코드는 Version 4에서 검증된 공식 RealMLP capacity/activity 구조로 복원됐습니다. 모델 구조를 유지하는 조건에서는 진정한 24시간 공동출력이 불가능하므로, 향후 24시간 정보는 모델 밖의 입력 feature engineering으로만 추가합니다.
 
-현재 전략은 `all-history-masked`입니다. 2022년 행도 학습에 유지해 group 1·2가 shared trunk를 업데이트하고, 정답이 없는 group 3 head의 loss만 제외합니다. 세 타깃이 모두 결측인 행만 학습에서 제거합니다.
+    train_loss = capacity_loss + 0.15 × activity_BCE
+
+Version 5 uses the unchanged multi-output RealMLP with the original sigmoid
+FICR surrogate (`temperature=0.01`). For epoch selection, seven complete
+forecast days are randomly selected from every month of 2023 with seed 42.
+The resulting validation set contains the same 168 hourly rows per month.
+
+    capacity_loss = 0.25 × smooth_MAE + 0.75 × (1-soft_FICR)
+    train_loss = capacity_loss + 0.15 × activity_BCE
+
+Each selected 24-hour forecast batch has an 11-hour purge on both sides. The
+balanced validation loss selects the epoch. One RealMLP is then refitted on
+all 2022-2023 history at that epoch and evaluated on the full 2024 outer
+holdout. Submission generation performs one final refit on all available
+2022-2024 labels. Reliability weighting, stacking, Boundary Consistency, and
+Temporal GroupDRO are disabled.
+
+RealMLP의 hidden layer, optimizer, dropout, weight decay, ensemble 및
+coslog4 scheduler 설정은 기존과 동일합니다. 세 그룹은 기존 shared trunk와
+각 output head에서 함께 학습하며, 변경점은 validation 및 epoch 선택 방식뿐입니다.
 
     .\scripts\setup_env.ps1
     .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs @('--max-epochs','200','--learning-rate','0.02','--activity-loss-weight','0.15')
 
-Version 4 산출물은 기존 결과와 섞이지 않도록 다음 경로를 사용합니다.
+Version 5 산출물은 기존 결과와 섞이지 않도록 다음 경로를 사용합니다.
 
-    model_outputs/v4/activity_aux_lr_0p02/
-    reports/v4/activity_aux_lr_0p02/
+    model_outputs/v5/monthly_random_sigmoid_lr_0p02/
+    reports/v5/monthly_random_sigmoid_lr_0p02/
 
 - results.csv: 전체 validation 및 DACON 지표
 - group_metrics.csv: 타깃별 지표
@@ -82,6 +102,7 @@ Version 4 산출물은 기존 결과와 섞이지 않도록 다음 경로를 사
 - training_summary.csv: 최적 epoch와 학습 시간
 - training_history.csv: epoch별 전체·그룹별 train/validation loss와 score
 - figures/training_curves.png: 전체·그룹별 train/validation loss 변화
+- figures/validation_ficr.png: epoch별 exact validation FICR 변화
 
 ## 5. Version 4 기준선: Version 3 LR 비교
 
@@ -149,3 +170,14 @@ Validation loss는 0.5에서 학습되지 않은 것이 아니라 전체 기준 
 Activity 실험도 epoch 44에서 capacity validation loss `0.456359`를 기록한 뒤 epoch 200에는 `0.527273`으로 상승했습니다. 같은 기간 train loss는 `0.480889`에서 `0.079315`로 감소해, 보조 학습이 점수를 일부 개선했지만 과적합 자체는 해소하지 못했습니다. 다음 버전에서는 학습 구조를 변경해 과적합 완화를 시도합니다.
 
 ![Version 4 activity auxiliary train/validation loss](reports/v4/activity_aux_lr_0p02/figures/training_curves.png)
+
+## 7. Version 5 과적합 완화 실험
+
+Version 4 activity auxiliary 이후 temporal domain-adversarial과 latent operating-regime mixture도 과적합을 개선하지 못했습니다. 24시간 공동예측은 별도 temporal network가 필요해 모델 구조 유지 조건과 충돌하므로 채택하지 않았습니다. 현재 코드는 공식 RealMLP activity 구조로 복원한 상태입니다.
+
+| Validation score | 1-NMAE | FICR | 선택 epoch | 과적합 변화 |
+|---:|---:|---:|---:|:---|
+| 0.658236 (temporal domain) | 0.876146 | 0.440327 | 50 | 개선 없음, 제거 |
+| 0.647679 (latent regime) | 0.874754 | 0.420605 | 8 | 개선 없음, 제거 |
+
+운전 상태 audit에서 GFS 100 m 풍속 0.5 m/s 구간 기준 저출력(CF<0.10)과 정상출력(CF>0.40)이 동시에 나타나는 구간에 group 1·2 관측의 약 64%, group 3의 약 54%가 포함됐습니다. 이는 curtailment 확정 라벨이 아니라 mixture 가설을 시험할 근거로만 사용합니다.

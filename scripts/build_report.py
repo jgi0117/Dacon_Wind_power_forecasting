@@ -18,7 +18,7 @@ DISPLAY_NAMES = {
     'realmlp': 'RealMLP',
 }
 LOSS_NAMES = {
-    'realmlp': 'ficr-aware',
+    'realmlp': 'sigmoid-ficr-aware-monthly-random',
 }
 
 
@@ -100,16 +100,31 @@ def _result_frames(
                 'multitask', metadata_by_target.get(target, {})
             )
             rows_by_target = metadata.get('n_fit_rows_by_target', {})
+            stacked_group3 = bool(metadata.get('stacking'))
+            if stacked_group3 and target == 'kpx_group_3':
+                best_iteration = metadata.get('group3_best_iteration')
+                max_training_length = metadata.get('group3_epochs')
+                elapsed_seconds = metadata.get('group3_elapsed_seconds')
+            elif stacked_group3:
+                best_iteration = metadata.get('stage1_best_iteration')
+                max_training_length = metadata.get('stage1_epochs')
+                elapsed_seconds = metadata.get('stage1_elapsed_seconds')
+            else:
+                best_iteration = metadata.get('best_iteration')
+                max_training_length = metadata.get(
+                    'max_epochs', metadata.get('max_iterations')
+                )
+                elapsed_seconds = metadata.get(
+                    'elapsed_seconds_all_fits', metadata.get('elapsed_seconds')
+                )
             training.append({
                 'model': model,
                 'target': target,
                 'n_fit_rows': rows_by_target.get(
                     target, metadata.get('n_fit_rows')
                 ),
-                'best_iteration': metadata.get('best_iteration'),
-                'max_training_length': metadata.get(
-                    'max_epochs', metadata.get('max_iterations')
-                ),
+                'best_iteration': best_iteration,
+                'max_training_length': max_training_length,
                 'loss_name': metadata.get(
                     'loss_name', LOSS_NAMES[model]
                 ),
@@ -117,7 +132,7 @@ def _result_frames(
                     'selection_metric',
                     'ficr-aware-loss',
                 ),
-                'elapsed_seconds': metadata.get('elapsed_seconds'),
+                'elapsed_seconds': elapsed_seconds,
             })
     results_frame = pd.DataFrame(results).sort_values(
         'validation_score', ascending=False, ignore_index=True
@@ -133,12 +148,14 @@ def _history_frame(reports: dict[str, dict[str, Any]]) -> pd.DataFrame:
         multitask = metadata_by_target.get('multitask')
         if multitask:
             for item in multitask.get('training_history', []):
-                rows.append({
+                aggregate_row = {
                     'model': model, 'target': 'all',
                     'step': item.get('step'),
                     'train_loss': item.get('train_loss'),
                     'validation_loss': item.get('validation_loss'),
                     'validation_score': item.get('validation_score'),
+                    'validation_nmae': item.get('validation_nmae'),
+                    'validation_ficr': item.get('validation_ficr'),
                     'training_objective_loss': item.get(
                         'training_objective_loss'
                     ),
@@ -146,7 +163,20 @@ def _history_frame(reports: dict[str, dict[str, Any]]) -> pd.DataFrame:
                     'activity_validation_loss': item.get(
                         'activity_validation_loss'
                     ),
+                    'boundary_consistency_train_loss': item.get(
+                        'boundary_consistency_train_loss'
+                    ),
+                    'boundary_consistency_validation_loss': item.get(
+                        'boundary_consistency_validation_loss'
+                    ),
+                }
+                aggregate_row.update({
+                    key: value for key, value in item.items()
+                    if (
+                        key.startswith('temporal_')
+                    )
                 })
+                rows.append(aggregate_row)
                 for target in TARGETS:
                     rows.append({
                         'model': model, 'target': target,
@@ -158,18 +188,33 @@ def _history_frame(reports: dict[str, dict[str, Any]]) -> pd.DataFrame:
                         'validation_score': item.get(
                             f'{target}__validation_score'
                         ),
+                        'validation_nmae': item.get(
+                            f'{target}__validation_nmae'
+                        ),
+                        'validation_ficr': item.get(
+                            f'{target}__validation_ficr'
+                        ),
                     })
             continue
         for target, metadata in metadata_by_target.items():
             for item in metadata.get('training_history', []):
                 rows.append({'model': model, 'target': target, **item})
-    columns = (
+    columns = [
         'model', 'target', 'step', 'train_loss',
         'validation_loss', 'validation_score',
+        'validation_nmae', 'validation_ficr',
         'training_objective_loss', 'activity_train_loss',
         'activity_validation_loss',
-    )
-    return pd.DataFrame(rows, columns=columns)
+        'boundary_consistency_train_loss',
+        'boundary_consistency_validation_loss',
+    ]
+    temporal_columns = sorted({
+        key for row in rows for key in row
+        if (
+            key.startswith('temporal_')
+        )
+    })
+    return pd.DataFrame(rows, columns=columns + temporal_columns)
 
 
 def _monthly_frame(runs_dir: Path) -> pd.DataFrame:
@@ -197,7 +242,7 @@ def _plot_scores(results: pd.DataFrame, path: Path) -> None:
         )
         ax.legend()
     ax.set_xlabel('Score (higher is better)')
-    ax.set_title('Version 4 multi-task RealMLP chronological validation score')
+    ax.set_title('Version 5 original RealMLP chronological validation score')
     lower = max(0.0, float(ordered['validation_score'].min()) - 0.03)
     upper_values = [float(ordered['validation_score'].max())]
     if ordered['dacon_score'].notna().any():
@@ -269,10 +314,34 @@ def _plot_histories(history: pd.DataFrame, path: Path) -> None:
                 color=colors[target], label=f'{target} validation',
             )
     ax.set_xlabel('Epoch')
-    ax.set_ylabel('FICR-aware loss')
-    ax.set_title('Version 4 multi-task RealMLP train / validation history')
+    ax.set_ylabel('Capacity objective loss')
+    ax.set_title('Version 5 monthly-balanced validation history')
     ax.grid(alpha=0.25)
     ax.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_validation_components(history: pd.DataFrame, path: Path) -> None:
+    fig, ax = plt.subplots(figsize=(10, 6))
+    colors = {
+        'all': '#222222', 'kpx_group_1': '#2878B5',
+        'kpx_group_2': '#E07B39', 'kpx_group_3': '#4E9F3D',
+    }
+    for target, color in colors.items():
+        selected = history.loc[history['target'] == target]
+        if selected.empty or not selected['validation_ficr'].notna().any():
+            continue
+        ax.plot(
+            selected['step'], selected['validation_ficr'],
+            color=color, label=target,
+        )
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Exact validation FICR')
+    ax.set_title('Monthly-balanced random validation: exact FICR')
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -302,12 +371,14 @@ def main() -> None:
     parser.add_argument(
         '--runs-dir',
         type=Path,
-        default=Path('model_outputs/v4/multitask_lr_0p02/runs'),
+        default=Path(
+            'model_outputs/v5/monthly_random_sigmoid_lr_0p02/runs'
+        ),
     )
     parser.add_argument(
         '--output-dir',
         type=Path,
-        default=Path('reports/v4/multitask_lr_0p02'),
+        default=Path('reports/v5/monthly_random_sigmoid_lr_0p02'),
     )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -330,7 +401,12 @@ def main() -> None:
     training.to_csv(output / 'training_summary.csv', index=False, encoding='utf-8')
     history_path = output / 'training_history.csv'
     history_figure = figures / 'training_curves.png'
+    ficr_figure = figures / 'validation_ficr.png'
     realmlp_history = history.loc[history['model'] == 'realmlp']
+    ficr_available = (
+        not realmlp_history.empty
+        and realmlp_history['validation_ficr'].notna().any()
+    )
     if history.empty:
         history_path.unlink(missing_ok=True)
     else:
@@ -339,6 +415,10 @@ def main() -> None:
         history_figure.unlink(missing_ok=True)
     else:
         _plot_histories(realmlp_history, history_figure)
+    if not ficr_available:
+        ficr_figure.unlink(missing_ok=True)
+    else:
+        _plot_validation_components(realmlp_history, ficr_figure)
     monthly.to_csv(output / 'monthly_metrics.csv', index=False, encoding='utf-8')
     _plot_scores(results, figures / 'score_comparison.png')
     _plot_dacon_components(results, figures / 'dacon_components.png')
@@ -346,8 +426,12 @@ def main() -> None:
         '\n\n![Training curves](figures/training_curves.png)\n\n'
         if not realmlp_history.empty else '\n\n'
     )
+    if ficr_available:
+        history_section += (
+            '![Exact validation FICR](figures/validation_ficr.png)\n\n'
+        )
     (output / 'RESULTS.md').write_text(
-        '# Version 4 multi-task RealMLP results\n\n'
+        '# Version 5 monthly-balanced random validation results\n\n'
         + _markdown_table(results)
         + '\n\n![Validation score](figures/score_comparison.png)\n\n'
         + '![DACON components](figures/dacon_components.png)\n\n'

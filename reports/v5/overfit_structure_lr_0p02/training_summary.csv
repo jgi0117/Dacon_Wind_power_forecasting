@@ -1,0 +1,4 @@
+model,target,n_fit_rows,best_iteration,max_training_length,loss_name,selection_metric,elapsed_seconds
+realmlp,kpx_group_1,17411,76,200,ficr-aware,ficr-aware-loss,3327.335050900001
+realmlp,kpx_group_2,17412,76,200,ficr-aware,ficr-aware-loss,3327.335050900001
+realmlp,kpx_group_3,8749,76,200,ficr-aware,ficr-aware-loss,3327.335050900001
