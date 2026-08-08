@@ -1,4 +1,4 @@
-'''Lazy model registry for independent optional-dependency execution.'''
+"""Lazy model registry for independent optional-dependency execution."""
 
 from __future__ import annotations
 
@@ -17,34 +17,52 @@ def build_model(
     *,
     iterations: dict[str, int] | int | None = None,
 ) -> RegressionModel:
-    if name == 'realmlp':
+    if name == "realmlp":
         if config.group3_stacking:
             from .stacked_realmlp_model import StackedGroup3RealMLPModel
-            return StackedGroup3RealMLPModel(config, iterations=iterations)
+
+            return StackedGroup3RealMLPModel(
+                config,
+                iterations=iterations,
+            )
 
         if config.teacher_student_distillation:
-            from .distilled_realmlp_model import DistilledTemporalRealMLPModel
+            from .distilled_realmlp_model import (
+                DistilledTemporalRealMLPModel,
+            )
+
             return DistilledTemporalRealMLPModel(
                 config,
                 iterations=iterations,
             )
 
         if config.temporal_prediction_correction:
-            from .temporal_correction_model import TemporalCorrectionRealMLPModel
+            from .temporal_correction_model import (
+                TemporalCorrectionRealMLPModel,
+            )
+
             return TemporalCorrectionRealMLPModel(
                 config,
                 iterations=iterations,
             )
 
-        from .realmlp_model import RealMLPModel
+        # Direct baseline after this change:
+        # weather/time + group/turbine metadata -> shared single-target RealMLP.
+        from .group_conditioned_realmlp_model import (
+            GroupConditionedRealMLPModel,
+        )
+
         epochs = (
-            iterations.get('student', iterations.get('multitask'))
+            iterations.get("student", iterations.get("multitask"))
             if isinstance(iterations, dict)
             else iterations
         )
-        return RealMLPModel(config, epochs=epochs)
+        return GroupConditionedRealMLPModel(
+            config,
+            epochs=epochs,
+        )
 
-    raise ValueError(f'Unsupported model: {name}')
+    raise ValueError(f"Unsupported model: {name}")
 
 
-__all__ = ['MODEL_NAMES', 'RegressionModel', 'build_model']
+__all__ = ["MODEL_NAMES", "RegressionModel", "build_model"]
