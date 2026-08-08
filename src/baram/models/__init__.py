@@ -21,20 +21,29 @@ def build_model(
         if config.group3_stacking:
             from .stacked_realmlp_model import StackedGroup3RealMLPModel
             return StackedGroup3RealMLPModel(config, iterations=iterations)
+
+        if config.teacher_student_distillation:
+            from .distilled_realmlp_model import DistilledTemporalRealMLPModel
+            return DistilledTemporalRealMLPModel(
+                config,
+                iterations=iterations,
+            )
+
         if config.temporal_prediction_correction:
-            from .temporal_correction_model import (
-                TemporalCorrectionRealMLPModel,
-            )
+            from .temporal_correction_model import TemporalCorrectionRealMLPModel
             return TemporalCorrectionRealMLPModel(
-                config, iterations=iterations
+                config,
+                iterations=iterations,
             )
+
         from .realmlp_model import RealMLPModel
         epochs = (
-            iterations.get('multitask')
+            iterations.get('student', iterations.get('multitask'))
             if isinstance(iterations, dict)
             else iterations
         )
         return RealMLPModel(config, epochs=epochs)
+
     raise ValueError(f'Unsupported model: {name}')
 
 
