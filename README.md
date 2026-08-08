@@ -52,7 +52,7 @@ Teacher가 현재 target `y_t` 또는 미래 target을 직접 입력받지 않�
 ```
 y_distilled
   = 0.80 × y_true
-  \+ 0.20 × y_teacher
+  + 0.20 × y_teacher
 ```
 
 Version 5의 기준 distillation teacher weight는 `0.20`입니다. Teacher OOF prediction이 존재하지 않는 구간은 기존 hard target을 그대로 사용합니다.
@@ -108,7 +108,7 @@ Student epoch는 실제 validation target을 기준으로 선택한 뒤, 선택�
 
 실행 예시는 다음과 같습니다.
 
-```
+```powershell
 .\scripts\run_models.ps1 `
   -Models realmlp `
   -Device cpu `
@@ -134,9 +134,9 @@ DACON 결과에서도 1-NMAE가 `0.864029 → 0.867068`, FICR이 `0.401719 → 0
 
 반면 Validation과 DACON 사이에는 약 `0.0323`의 score 차이가 있었으며, 특히 FICR이 `0.454189 → 0.409749`로 상대적으로 크게 감소했습니다.
 
-![Version 5 score comparison](reports/v5/temporal_oof_correction_lr_0p02/figures/score_comparison.png)
+![Version 5 score comparison](reports/v5/distilled_realmlp/figures/score_comparison.png)
 
-![Version 5 DACON components](reports/v5/temporal_oof_correction_lr_0p02/figures/dacon_components.png)
+![Version 5 DACON components](reports/v5/distilled_realmlp/figures/dacon_components.png)
 
 ### 그룹별 Validation 결과
 
@@ -158,13 +158,13 @@ Student epoch selection 과정에서는 약 30 epoch 이후 train loss가 계속
 
 ### Train / Validation Loss
 
-![Version 5 train validation curves](reports/v5/temporal_oof_correction_lr_0p02/figures/training_curves.png)
+![Version 5 train validation curves](reports/v5/distilled_realmlp/figures/training_curves.png)
 
 Train loss는 학습이 진행될수록 지속적으로 감소하지만 validation loss는 초반 최저점 이후 다시 증가합니다. 따라서 단순한 장기 학습보다 temporal validation을 이용한 epoch selection이 중요합니다.
 
 ### Validation FICR
 
-![Version 5 validation FICR](reports/v5/temporal_oof_correction_lr_0p02/figures/validation_ficr.png)
+![Version 5 validation FICR](reports/v5/distilled_realmlp/figures/validation_ficr.png)
 
 Validation FICR 역시 초기 구간에서 높은 값을 기록한 뒤 학습 후반으로 갈수록 감소합니다. 평균 오차뿐 아니라 6%·8% 오차 경계 적중률에서도 overfitting이 발생하는 것을 확인했습니다.
 
