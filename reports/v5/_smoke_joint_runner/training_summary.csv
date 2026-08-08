@@ -1,4 +1,0 @@
-model,target,n_fit_rows,best_iteration,max_training_length,loss_name,selection_metric,elapsed_seconds
-realmlp,kpx_group_1,17411,1,1,hourly-ficr-plus-6h-and-daily-coherence,ficr-aware-loss,2.2841260000132024
-realmlp,kpx_group_2,17412,1,1,hourly-ficr-plus-6h-and-daily-coherence,ficr-aware-loss,2.2841260000132024
-realmlp,kpx_group_3,8749,1,1,hourly-ficr-plus-6h-and-daily-coherence,ficr-aware-loss,2.2841260000132024

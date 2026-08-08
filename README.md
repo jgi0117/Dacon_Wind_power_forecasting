@@ -1,183 +1,209 @@
 # DACON 풍력 발전량 예측 — Version 5
 
-기상 예보 기반 풍력 발전량 예측 파이프라인입니다. Version 4는 multi-task RealMLP에 activity auxiliary objective를 추가해 소폭 개선했습니다. Version 5는 공식 RealMLP 구조를 유지한 상태에서 과적합 해결 방법을 검토합니다.
+기상 예보 기반 풍력 발전량 예측 파이프라인입니다. Version 4에서는 multi-task RealMLP에 activity auxiliary objective를 추가해 저출력 관측까지 학습 신호로 활용했습니다. Version 5에서는 현재 시점의 입력만 사용하는 기존 RealMLP에 **Teacher–Student Distillation**을 적용해, 학습 시에만 과거 12시간의 기상·발전량 정보를 간접적으로 활용합니다.
 
-- [Version 1 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v1.0.0): 5개 baseline 비교
-- [Version 2 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v2.0.0): FICR-aware 모델 비교와 RealMLP 선정
-- [Version 3 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v3.0.0): RealMLP 200-epoch learning-rate 비교
-- [Version 4 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v4.0.0): multi-task activity auxiliary objective
+Version 5 최종 결과는 **Validation score 0.670741, DACON score 0.638408**입니다.
+
+* [Version 1 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v1.0.0): 5개 baseline 비교
+* [Version 2 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v2.0.0): FICR-aware 모델 비교와 RealMLP 선정
+* [Version 3 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v3.0.0): RealMLP 200-epoch learning-rate 비교
+* [Version 4 tag](https://github.com/jgi0117/Dacon_Wind_power_forecasting/tree/v4.0.0): multi-task RealMLP + activity auxiliary objective
 
 ## 1. 프로젝트 개요
 
-기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개 그룹(kpx_group_1~3)을 예측하는 회귀 프로젝트입니다. Version 5는 PyTabKit RealMLP의 hidden layer, optimizer, scheduler와 ensemble 구조를 변경하지 않습니다.
+기상 예보와 시간 정보를 이용해 2025년의 시간별 풍력 발전량 3개 그룹(`kpx_group_1~3`)을 예측하는 회귀 프로젝트입니다.
 
 평가식은 다음과 같습니다.
 
-    score = 0.5 × (1-NMAE) + 0.5 × FICR
+```
+score = 0.5 × (1-NMAE) + 0.5 × FICR
+```
 
-## 2. 데이터 전처리 방식
+Version 5는 Version 4의 multi-output RealMLP, FICR-aware loss, activity auxiliary objective를 유지하면서 temporal information을 추가로 학습시키는 것을 목표로 합니다.
 
-원본 데이터는 Git에 포함하지 않습니다. 전처리 결과는 2022-01-01 01:00부터 2025-01-01 00:00까지의 학습 데이터 26,304행과, 2025-01-01 01:00부터 2026-01-01 00:00까지의 테스트 데이터 8,760행으로 구성됩니다.
+학습 데이터는 2022-01-01 01:00부터 2025-01-01 00:00까지 26,304시간이며, Test는 2025년 8,760시간입니다.
 
-현재 hybrid 특성 세트는 총 655개입니다.
+현재 모델 입력은 시간 정보와 LDAPS/GFS 기상 예보로 구성됩니다. 실제 Test에서 사용할 수 없는 SCADA와 과거 실제 발전량은 Student의 직접 입력으로 사용하지 않습니다.
 
-- 시간: 월·일·시각의 주기형(sin/cos) 특성
-- 기상: LDAPS 16개 격자와 GFS 9개 격자의 예보 변수
-- 풍속·풍향: 벡터 성분, 풍속의 제곱·세제곱, 고도 간 shear와 비율
-- 공간 요약: 격자별 평균·표준편차·최솟값·최댓값과 선택 격자값
-- 결측 처리: 동일한 예보 배치와 격자 안에서만 보간하고, 남은 값은 학습 구간 격자 중앙값으로 채우며 결측 표시 특성을 유지
-- 타깃: 발전량을 설비용량으로 나눈 capacity factor로 학습하고 예측 후 원 단위로 복원
+## 2. Version 5 학습 전략
 
-미래 정보 누수를 막기 위해 예보 생성 시각과 사용 가능 시각을 엄격하게 제한합니다.
+Version 4의 RealMLP은 현재 시점의 기상·시간 정보만 입력받습니다. Version 5에서는 과거 발전량과 기상 변화의 temporal pattern을 활용하기 위해 Teacher–Student 구조를 추가했습니다.
 
-    .\.venv313\Scripts\python.exe preprocessing.py --data-dir data --output-dir artifacts --mode hybrid
+Teacher는 학습 단계에서만 다음 정보를 사용합니다.
 
-## 3. Version 4 학습 전략
+```
+Teacher:
+X_t
++ X_(t-1:t-12)
++ y_(t-1:t-12)
+```
 
-### 시간 순 검증
+Student는 학습과 실제 추론 모두 현재 시점 입력만 사용합니다.
 
-1. 2023-12-31 14:00 이전 데이터를 학습에 사용합니다.
-2. 경계에서 11시간을 purge합니다.
-3. 2024년 1~3월을 epoch 선택용 validation으로 사용합니다.
-4. 2024년 7~12월을 최종 비교 구간으로 유지합니다.
-5. 선택된 epoch로 사용 가능한 전체 과거 데이터를 다시 학습해 테스트를 예측합니다.
+```
+Student:
+X_t → RealMLP → prediction
+```
 
-하나의 shared trunk가 세 그룹의 공통 기상·시간 표현을 학습하고, 3-output prediction layer의 그룹별 head가 각 발전량을 출력합니다. 특정 그룹의 타깃이 없는 행은 해당 그룹 loss에서만 제외하는 target mask를 사용합니다. 따라서 group 1 head는 그룹 2·3의 정답을 직접 입력받지 않지만, shared trunk에 전달되는 gradient를 통해 다른 그룹의 학습 신호를 간접적으로 활용할 수 있습니다.
+Teacher가 현재 target `y_t` 또는 미래 target을 직접 입력받지 않도록 하며, Teacher prediction은 chronological expanding-window OOF 방식으로 생성합니다. 각 Teacher는 자신이 예측할 구간보다 이전 데이터만 이용해 학습합니다.
 
-Version 3에서 train loss 수렴이 가장 안정적이었던 LR 0.02를 기준값으로 고정합니다. 최대 200 epoch를 실행하고 세 그룹의 평균 validation loss가 가장 낮은 epoch를 최종 전체 데이터 재학습 길이로 사용합니다. Version 3와 동일하게 `lr_sched=coslog4`, dropout 0.15, Adam을 유지해 모델 구조 변화의 효과만 비교합니다.
+생성된 Teacher OOF prediction은 실제 label과 혼합해 Student target으로 사용합니다.
 
-### FICR-aware loss
+```
+y_distilled
+  = 0.80 × y_true
+  \+ 0.20 × y_teacher
+```
 
-각 그룹에 대해 FICR의 6%와 8% 오차 경계를 sigmoid로 근사한 soft-FICR을 사용합니다.
+Version 5의 기준 distillation teacher weight는 `0.20`입니다. Teacher OOF prediction이 존재하지 않는 구간은 기존 hard target을 그대로 사용합니다.
 
-    group_loss = 0.25 × smooth-MAE + 0.75 × (1-soft-FICR)
-    total_loss = mean(valid group losses)
+Teacher는 학습 과정에서만 사용되며 최종 DACON Test에서는 Student만 사용합니다.
 
-기본 FICR 비중은 0.75, sigmoid temperature는 0.01입니다. 전체 loss와 함께 그룹별 train loss, validation loss, competition score를 기록해 한 그룹의 개선이 다른 그룹의 악화에 가려지지 않도록 합니다.
+```
+Training
 
-### Activity auxiliary objective
+12h History + Current X
+          │
+          ▼
+       Teacher
+          │
+          ▼
+    OOF Prediction
+          │
+    hard/soft blend
+          │
+          ▼
+       Student
+          ▲
+          │
+         X_t
 
-기존 capacity loss는 평가 대상인 capacity factor 0.10 이상에서만 계산되어, 학습에 로드된 행 중 약 34.8%는 모든 그룹의 loss가 0이었습니다. Version 4의 최종 실험은 각 그룹이 capacity factor 0.10 이상인지 예측하는 activity logit을 추가합니다.
 
-    train_loss = capacity_loss + 0.15 × activity_BCE
+Inference
 
-결측 타깃은 `-1` sentinel로 분리하며 activity BCE는 결측을 제외한 실제 0 및 저출력 관측에도 적용합니다. best epoch는 기존 FICR-aware capacity validation loss로만 선택하고, submission에는 세 capacity 출력만 사용합니다.
+         X_test
+            │
+            ▼
+         Student
+            │
+            ▼
+       Prediction
+```
 
-## 4. Version 5 구현 및 산출물
+RealMLP의 주요 설정은 Version 4와 동일하게 유지합니다.
 
-시간 domain-adversarial, latent regime mixture와 24시간 temporal encoder/decoder는 제거했습니다. 현재 코드는 Version 4에서 검증된 공식 RealMLP capacity/activity 구조로 복원됐습니다. 모델 구조를 유지하는 조건에서는 진정한 24시간 공동출력이 불가능하므로, 향후 24시간 정보는 모델 밖의 입력 feature engineering으로만 추가합니다.
+* hidden layer: `256 × 3`
+* activation: Mish
+* dropout: `0.15`
+* learning rate: `0.02`
+* FICR weight: `0.75`
+* activity loss weight: `0.15`
+* ensemble: `8`
+* Student maximum epoch: `200`
+* Teacher epoch: `100`
+* Teacher history: `12시간`
+* Teacher OOF folds: `4`
 
-    train_loss = capacity_loss + 0.15 × activity_BCE
+Student epoch는 실제 validation target을 기준으로 선택한 뒤, 선택된 epoch로 다시 학습합니다.
 
-Version 5 uses the unchanged multi-output RealMLP with the original sigmoid
-FICR surrogate (`temperature=0.01`). For epoch selection, seven complete
-forecast days are randomly selected from every month of 2023 with seed 42.
-The resulting validation set contains the same 168 hourly rows per month.
+실행 예시는 다음과 같습니다.
 
-    capacity_loss = 0.25 × smooth_MAE + 0.75 × (1-soft_FICR)
-    train_loss = capacity_loss + 0.15 × activity_BCE
+```
+.\scripts\run_models.ps1 `
+  -Models realmlp `
+  -Device cpu `
+  -PipelineArgs @(
+    '--max-epochs', '200',
+    '--learning-rate', '0.02',
+    '--distillation-teacher-weight', '0.20'
+  )
+```
 
-Each selected 24-hour forecast batch has an 11-hour purge on both sides. The
-balanced validation loss selects the epoch. One RealMLP is then refitted on
-all 2022-2023 history at that epoch and evaluated on the full 2024 outer
-holdout. Submission generation performs one final refit on all available
-2022-2024 labels. Reliability weighting, stacking, Boundary Consistency, and
-Temporal GroupDRO are disabled.
+## 3. Version 5 결과
 
-RealMLP의 hidden layer, optimizer, dropout, weight decay, ensemble 및
-coslog4 scheduler 설정은 기존과 동일합니다. 세 그룹은 기존 shared trunk와
-각 output head에서 함께 학습하며, 변경점은 validation 및 epoch 선택 방식뿐입니다.
+### Validation 및 DACON 결과
 
-    .\scripts\setup_env.ps1
-    .\scripts\run_models.ps1 -Models realmlp -Device cpu -PipelineArgs @('--max-epochs','200','--learning-rate','0.02','--activity-loss-weight','0.15')
+| Model                        | Validation score | Validation 1-NMAE | Validation FICR |  DACON score | DACON 1-NMAE |   DACON FICR |
+| :--------------------------- | ---------------: | ----------------: | --------------: | -----------: | -----------: | -----------: |
+| Version 4 Activity Auxiliary |         0.666023 |          0.880581 |        0.451466 |     0.632874 |     0.864029 |     0.401719 |
+| Version 5 Distilled RealMLP  |     **0.670741** |      **0.887293** |    **0.454189** | **0.638408** | **0.867068** | **0.409749** |
 
-Version 5 산출물은 기존 결과와 섞이지 않도록 다음 경로를 사용합니다.
+Version 5는 Version 4 대비 Validation score가 약 `+0.00472`, 실제 DACON score가 약 `+0.00553` 상승했습니다.
 
-    model_outputs/v5/monthly_random_sigmoid_lr_0p02/
-    reports/v5/monthly_random_sigmoid_lr_0p02/
+DACON 결과에서도 1-NMAE가 `0.864029 → 0.867068`, FICR이 `0.401719 → 0.409749`로 모두 개선되어 Teacher–Student Distillation의 효과가 실제 Test에서도 확인됐습니다.
 
-- results.csv: 전체 validation 및 DACON 지표
-- group_metrics.csv: 타깃별 지표
-- monthly_metrics.csv: 월별 지표
-- training_summary.csv: 최적 epoch와 학습 시간
-- training_history.csv: epoch별 전체·그룹별 train/validation loss와 score
-- figures/training_curves.png: 전체·그룹별 train/validation loss 변화
-- figures/validation_ficr.png: epoch별 exact validation FICR 변화
+반면 Validation과 DACON 사이에는 약 `0.0323`의 score 차이가 있었으며, 특히 FICR이 `0.454189 → 0.409749`로 상대적으로 크게 감소했습니다.
 
-## 5. Version 4 기준선: Version 3 LR 비교
+![Version 5 score comparison](reports/v5/temporal_oof_correction_lr_0p02/figures/score_comparison.png)
 
-Version 3는 RealMLP을 200 epoch까지 학습하면서 LR만 변경하는 실험입니다. 아래 DACON 점수는 제출 화면의 값을 기록했습니다.
+![Version 5 DACON components](reports/v5/temporal_oof_correction_lr_0p02/figures/dacon_components.png)
 
-| LR | Validation score | DACON score | DACON 1-NMAE | DACON FICR | 상태 |
-|---:|---:|---:|---:|---:|:---|
-| 0.2 | 0.653255 | 0.631055 | 0.861265 | 0.400845 | 완료 |
-| 0.02 | 0.650715 | 0.625799 | 0.861005 | 0.390592 | 완료 |
-| 0.002 | 0.658018 | 0.630061 | 0.859115 | 0.401007 | 완료 |
+### 그룹별 Validation 결과
 
-LR 0.02는 LR 0.2보다 DACON score가 0.005256 낮았습니다. 1-NMAE 차이는 0.000260에 불과하지만 FICR은 0.010253 낮아, 현재 점수 하락은 주로 임계 오차 구간을 반영하는 FICR에서 발생했습니다.
+| Group   |   1-NMAE |     FICR |    ≤6% |   6~8% |    >8% |
+| :------ | -------: | -------: | -----: | -----: | -----: |
+| Group 1 | 0.903347 | 0.515106 | 42.89% | 11.89% | 45.22% |
+| Group 2 | 0.892606 | 0.504737 | 40.41% | 10.68% | 48.91% |
+| Group 3 | 0.865927 | 0.342724 | 30.35% |  9.36% | 60.28% |
 
-LR 0.002는 가장 높은 validation score를 기록했지만 DACON score는 LR 0.2보다 0.000994 낮았습니다. FICR은 0.000162 높았으나 1-NMAE가 0.002150 낮아 최종 점수에서는 LR 0.2가 가장 좋았습니다. 따라서 이번 세 설정에서는 validation 순위와 DACON 순위가 일치하지 않습니다.
+Group 1·2의 FICR은 0.50 이상인 반면 Group 3는 `0.342724`로 낮았습니다.
 
-### Epoch별 train/validation loss
+Group 3는 2022년 target 전체가 결측이어서 Group 1·2보다 실제 target history가 짧습니다. 또한 Group 1·2는 VESTAS V126, Group 3는 UNISON U136으로 터빈 구성이 다릅니다. 현재 모델에서는 Group 3의 2022년 target을 임의로 보간하거나 0으로 채우지 않고 해당 target loss에서 제외합니다.
 
-| LR | 타깃 | 최저 validation loss (epoch) | 마지막 validation loss | 마지막 train loss |
-|---:|:---|---:|---:|---:|
-| 0.2 | kpx_group_1 | 0.436019 (39) | 0.500106 | 0.151207 |
-| 0.2 | kpx_group_2 | 0.438524 (45) | 0.466366 | 0.132179 |
-| 0.2 | kpx_group_3 | 0.500893 (100) | 0.571429 | 0.224855 |
-| 0.02 | kpx_group_1 | 0.418604 (66) | 0.524344 | 0.107267 |
-| 0.02 | kpx_group_2 | 0.429704 (64) | 0.459624 | 0.085195 |
-| 0.02 | kpx_group_3 | 0.479859 (81) | 0.564102 | 0.214852 |
-| 0.002 | kpx_group_1 | 0.417816 (152) | 0.459712 | 0.405072 |
-| 0.002 | kpx_group_2 | 0.432524 (159) | 0.451317 | 0.360022 |
-| 0.002 | kpx_group_3 | 0.493675 (180) | 0.499069 | 0.461288 |
+## 4. 학습 과정
 
-세 LR 모두 train loss가 마지막 epoch까지 감소하므로 수치적으로 발산하지는 않았습니다. LR 0.2와 0.02는 validation loss가 비교적 이른 최저점 이후 다시 상승해 과적합이 나타납니다. LR 0.002는 train loss가 상대적으로 높고 최적 epoch가 152~180으로 늦어 수렴 속도가 느리지만, 200 epoch 안에서 validation loss 최저점에는 도달했습니다. 낮은 validation loss가 DACON 개선으로 이어지지 않은 점은 epoch 선택 구간과 실제 평가 구간 사이의 일반화 차이도 함께 봐야 함을 보여줍니다.
+Student epoch selection 과정에서는 약 30 epoch 이후 train loss가 계속 감소하는 반면 validation 성능은 다시 악화되는 과적합이 나타났습니다.
 
-#### LR 0.2
+최종 best iteration은 `31`이었으며, 200 epoch는 최종 학습 길이가 아니라 적절한 epoch를 탐색하기 위한 최대 범위입니다.
 
-![LR 0.2 RealMLP train/validation loss](reports/v3/lr_0p2/figures/training_curves.png)
+### Train / Validation Loss
 
-#### LR 0.02
+![Version 5 train validation curves](reports/v5/temporal_oof_correction_lr_0p02/figures/training_curves.png)
 
-![LR 0.02 RealMLP train/validation loss](reports/v3/lr_0p02/figures/training_curves.png)
+Train loss는 학습이 진행될수록 지속적으로 감소하지만 validation loss는 초반 최저점 이후 다시 증가합니다. 따라서 단순한 장기 학습보다 temporal validation을 이용한 epoch selection이 중요합니다.
 
-#### LR 0.002
+### Validation FICR
 
-![LR 0.002 RealMLP train/validation loss](reports/v3/lr_0p002/figures/training_curves.png)
+![Version 5 validation FICR](reports/v5/temporal_oof_correction_lr_0p02/figures/validation_ficr.png)
 
-## 6. Version 4 validation 결과
+Validation FICR 역시 초기 구간에서 높은 값을 기록한 뒤 학습 후반으로 갈수록 감소합니다. 평균 오차뿐 아니라 6%·8% 오차 경계 적중률에서도 overfitting이 발생하는 것을 확인했습니다.
 
-| 구조 | Validation score | 1-NMAE | FICR | 선택 epoch |
-|:---|---:|---:|---:|---:|
-| Version 3 독립 RealMLP, LR 0.02 | 0.650715 | 0.876935 | 0.424495 | 그룹별 64~81 |
-| Version 4 masked multi-task | 0.660839 | 0.880581 | 0.441097 | joint 45 |
-| Version 4 + activity auxiliary | 0.666023 | 0.880581 | 0.451466 | joint 44 |
+## 5. 구현 및 산출물
 
-Multi-task는 독립 학습보다 validation score가 0.010124 상승했습니다. 1-NMAE는 0.003646, FICR은 0.016602 상승해 전체적인 오차와 임계 구간 적중률이 모두 개선됐습니다. 특히 group 3는 NMAE가 0.142528에서 0.132280으로 감소하고 FICR이 0.357124에서 0.380157로 상승해 shared trunk의 이득이 가장 컸습니다.
+Teacher–Student Distillation은 다음 파일에서 구현합니다.
 
-Activity auxiliary는 direct multi-task보다 validation score가 0.005184 상승했습니다. 1-NMAE는 동일하고 FICR이 0.010369 상승했습니다. DACON public score는 `0.632874`로, 1-NMAE `0.864029`, FICR `0.401719`를 기록했습니다. 개선 폭은 작지만 기존에 버리던 저출력 관측을 보조 신호로 활용하는 효과가 확인됐습니다.
+```
+src/baram/models/distilled_realmlp_model.py
+```
 
-| 구분 | 최저 validation loss (epoch) | 해당 epoch train loss | 마지막 train loss | 마지막 validation loss |
-|:---|---:|---:|---:|---:|
-| 전체 | 0.460531 (45) | 0.494379 | 0.097565 | 0.530212 |
-| group 1 | 0.424952 (49) | 0.500290 | 0.098784 | 0.534004 |
-| group 2 | 0.423536 (71) | 0.441630 | 0.090668 | 0.462054 |
-| group 3 | 0.486385 (19) | 0.658346 | 0.103243 | 0.594578 |
+주요 기능은 다음과 같습니다.
 
-Validation loss는 0.5에서 학습되지 않은 것이 아니라 전체 기준 epoch 45까지 0.460531로 감소한 뒤 다시 상승했습니다. 반면 train loss는 0.097565까지 계속 감소했으므로 주된 문제는 수렴 실패나 결측 mask가 아니라 과적합입니다. joint epoch 45 선택은 정상적으로 동작했습니다. 이번 실험은 validation 비교까지만 사용하며 submission은 생성하지 않습니다.
+* 이전 12시간 feature/target history 생성
+* chronological Teacher OOF prediction
+* Teacher prediction과 hard label blending
+* Student epoch selection 및 refit
+* Student-only inference
 
-Activity 실험도 epoch 44에서 capacity validation loss `0.456359`를 기록한 뒤 epoch 200에는 `0.527273`으로 상승했습니다. 같은 기간 train loss는 `0.480889`에서 `0.079315`로 감소해, 보조 학습이 점수를 일부 개선했지만 과적합 자체는 해소하지 못했습니다. 다음 버전에서는 학습 구조를 변경해 과적합 완화를 시도합니다.
+Version 5 주요 산출물:
 
-![Version 4 activity auxiliary train/validation loss](reports/v4/activity_aux_lr_0p02/figures/training_curves.png)
+```
+model_outputs/v5/
+reports/v5/
+```
 
-## 7. Version 5 과적합 완화 실험
+* `results.csv`: 전체 validation 결과
+* `group_metrics.csv`: 그룹별 결과
+* `monthly_metrics.csv`: 월별 결과
+* `training_summary.csv`: best epoch와 학습 정보
+* `training_history.csv`: epoch별 학습 기록
+* `validation_predictions.csv`: validation prediction
+* `run_report.json`: 실행 configuration 및 metadata
+* `submission_realmlp.csv`: DACON 제출 파일
 
-Version 4 activity auxiliary 이후 temporal domain-adversarial과 latent operating-regime mixture도 과적합을 개선하지 못했습니다. 24시간 공동예측은 별도 temporal network가 필요해 모델 구조 유지 조건과 충돌하므로 채택하지 않았습니다. 현재 코드는 공식 RealMLP activity 구조로 복원한 상태입니다.
+## 6. 결론
 
-| Validation score | 1-NMAE | FICR | 선택 epoch | 과적합 변화 |
-|---:|---:|---:|---:|:---|
-| 0.658236 (temporal domain) | 0.876146 | 0.440327 | 50 | 개선 없음, 제거 |
-| 0.647679 (latent regime) | 0.874754 | 0.420605 | 8 | 개선 없음, 제거 |
+Version 5에서는 과거 12시간의 기상 및 실제 발전량을 학습 단계에서만 사용할 수 있도록 Teacher–Student Distillation을 적용했습니다.
 
-운전 상태 audit에서 GFS 100 m 풍속 0.5 m/s 구간 기준 저출력(CF<0.10)과 정상출력(CF>0.40)이 동시에 나타나는 구간에 group 1·2 관측의 약 64%, group 3의 약 54%가 포함됐습니다. 이는 curtailment 확정 라벨이 아니라 mixture 가설을 시험할 근거로만 사용합니다.
+Teacher prediction은 chronological OOF 방식으로 생성해 미래 target 정보가 섞이지 않도록 했으며, 최종 Student는 실제 Test와 동일하게 현재 시점의 기상·시간 정보만 사용합니다.
+
+Teacher weight `0.20`을 적용한 결과 Validation score는 `0.670741`, DACON score는 `0.638408`을 기록했습니다. Version 4 대비 Validation과 DACON에서 모두 성능이 향상되어 temporal information을 Student에 간접적으로 전달하는 방식의 효과를 확인했습니다.

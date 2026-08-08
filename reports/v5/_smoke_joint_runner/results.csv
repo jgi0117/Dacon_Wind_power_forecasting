@@ -1,2 +1,0 @@
-rank,model,display_name,validation_score,one_minus_nmae,ficr,dacon_score,dacon_one_minus_nmae,dacon_ficr
-1,realmlp,RealMLP,0.5799726144207381,0.8360328460614138,0.32391238278006235,,,
