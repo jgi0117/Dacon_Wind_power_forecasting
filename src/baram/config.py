@@ -40,12 +40,24 @@ class PipelineConfig:
     group3_reliability_min_weight: float = 0.2
     group3_stacking: bool = False
 
-    # New default path: privileged temporal teacher -> direct student.
+    # Privileged temporal teacher -> direct student.
     teacher_student_distillation: bool = True
     teacher_history_hours: int = 12
-    teacher_oof_folds: int = 4
+
+    # Three expanding chronological OOF blocks.
+    teacher_oof_folds: int = 3
+
+    # Applied independently to each KPX group.
     teacher_min_train_rows: int = 720
+
+    # Maximum epoch count used by each Teacher epoch selector.
     teacher_epochs: int = 100
+
+    # Last 20% of each fold's available past is used only for chronological
+    # Teacher epoch selection.  After selecting the epoch, the Teacher is
+    # refitted on the complete past history.
+    teacher_inner_validation_fraction: float = 0.20
+
     distillation_teacher_weight: float = 0.20
 
     # Legacy prediction-context correction remains available as a fallback.
@@ -129,9 +141,18 @@ def parse_args() -> PipelineConfig:
         ),
     )
     parser.add_argument('--teacher-history-hours', type=int, default=12)
-    parser.add_argument('--teacher-oof-folds', type=int, default=4)
+    parser.add_argument('--teacher-oof-folds', type=int, default=3)
     parser.add_argument('--teacher-min-train-rows', type=int, default=720)
     parser.add_argument('--teacher-epochs', type=int, default=100)
+    parser.add_argument(
+        '--teacher-inner-validation-fraction',
+        type=float,
+        default=0.20,
+        help=(
+            'Chronological fraction at the end of each Teacher fold history '
+            'used only for Teacher epoch selection.'
+        ),
+    )
     parser.add_argument(
         '--distillation-teacher-weight',
         type=float,
@@ -197,6 +218,10 @@ def parse_args() -> PipelineConfig:
         parser.error('--activity-loss-weight must be non-negative.')
     if not 0.0 <= values['distillation_teacher_weight'] <= 1.0:
         parser.error('--distillation-teacher-weight must be between 0 and 1.')
+    if not 0.0 < values['teacher_inner_validation_fraction'] < 0.5:
+        parser.error(
+            '--teacher-inner-validation-fraction must be in (0, 0.5).'
+        )
 
     if values['temporal_group_dro'] and values['ficr_loss'] != 'sigmoid':
         parser.error('--temporal-group-dro requires --ficr-loss sigmoid.')
@@ -253,10 +278,16 @@ def parse_args() -> PipelineConfig:
         models = DEFAULT_MODEL_NAMES
     elif 'all' in requested_models:
         if requested_models != ['all']:
-            parser.error('--models all cannot be combined with another model name.')
+            parser.error(
+                '--models all cannot be combined with another model name.'
+            )
         models = SUPPORTED_MODEL_NAMES
     else:
-        models = tuple(dict.fromkeys(requested_models))
+        models = tuple(
+            dict.fromkeys(
+                requested_models
+            )
+        )
 
     output_dir = values.pop('output_dir')
     if output_dir is None:
@@ -269,6 +300,13 @@ def parse_args() -> PipelineConfig:
                 'model_outputs/v5/temporal_oof_correction_lr_0p02/runs'
             ) / '_'.join(models)
         else:
-            output_dir = Path('model_outputs/direct_realmlp/runs') / '_'.join(models)
+            output_dir = (
+                Path('model_outputs/direct_realmlp/runs')
+                / '_'.join(models)
+            )
 
-    return PipelineConfig(models=models, output_dir=output_dir, **values)
+    return PipelineConfig(
+        models=models,
+        output_dir=output_dir,
+        **values,
+    )
