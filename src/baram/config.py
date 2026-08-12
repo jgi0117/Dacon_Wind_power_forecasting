@@ -8,10 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .constants import (
-    DEFAULT_MODEL_NAMES,
-    SUPPORTED_MODEL_NAMES,
-)
+from .constants import DEFAULT_MODEL_NAMES, SUPPORTED_MODEL_NAMES
 
 
 @dataclass(frozen=True)
@@ -20,9 +17,11 @@ class PipelineConfig:
     data_dir: Path = Path("data")
     output_dir: Path = Path("model_outputs")
     models: tuple[str, ...] = DEFAULT_MODEL_NAMES
+
     validation_start: str = "2024-01-01 01:00:00"
     iteration_selection_end: str = "2024-04-01 01:00:00"
     comparison_start: str = "2024-10-01 01:00:00"
+
     seed: int = 42
     n_jobs: int = -1
     max_epochs: int = 200
@@ -30,51 +29,51 @@ class PipelineConfig:
     early_stopping_min_delta: float = 1e-5
     batch_size: int = 256
     learning_rate: float = 0.02
+
     ficr_weight: float = 0.75
     ficr_temperature: float = 0.01
     ficr_loss: str = "sigmoid"
     ficr_relu_margin: float = 0.005
+
     temporal_group_dro: bool = False
     temporal_group_dro_eta: float = 0.05
+
     group3_reliability_weighting: bool = False
     group3_reliability_min_weight: float = 0.2
     group3_stacking: bool = False
 
-    # Teacher / Student distillation.
+    # Version 6 Teacher / Student distillation.
     teacher_student_distillation: bool = True
 
-    # Student sees current X + previous N hours of X.
-    # Teacher sees the same Student X plus previous N hours of same-group y.
+    # Student: current X + previous N hours of X.
+    # Teacher: same Student X + previous N hours of same-group y.
     student_history_hours: int = 5
     teacher_history_hours: int = 5
-
-    # Additional recency-weighted summary of X lags.
-    # lag1 weight=1.0, lag2=decay, lag3=decay^2, ...
     history_decay: float = 0.80
 
-    # Expanding chronological Teacher OOF blocks.
     teacher_oof_folds: int = 3
-
-    # Applied independently to each KPX group.
     teacher_min_train_rows: int = 720
-
-    # Maximum epoch count used by each Teacher epoch selector.
     teacher_epochs: int = 100
-
-    # Last 20% of each fold's available past is used only for chronological
-    # Teacher epoch selection. After selecting the epoch, Teacher is refitted
-    # on the complete past history.
     teacher_inner_validation_fraction: float = 0.20
-
     distillation_teacher_weight: float = 0.20
 
-    # Legacy prediction-context correction remains available as a fallback.
+    # Legacy correction options kept for compatibility.
     temporal_prediction_correction: bool = False
     correction_validation_start: str = "2024-07-01 01:00:00"
     temporal_oof_year: int = 2024
 
     ficr_boundary_consistency_weight: float = 0.0
     activity_loss_weight: float = 0.15
+
+    # Version 6 experimental G3 residual stage.
+    group3_residual: bool = False
+    group3_residual_validation_start: str = "2024-07-01 01:00:00"
+    group3_residual_epochs: int = 80
+    group3_residual_ensemble: int = 8
+    group3_residual_learning_rate: float = 0.02
+    group3_residual_batch_size: int = 256
+    group3_residual_max_abs_correction: float = 0.20
+
     device: str | None = None
     evaluation_only: bool = False
 
@@ -98,6 +97,7 @@ def parse_args() -> PipelineConfig:
     parser.add_argument("--validation-start", default="2024-01-01 01:00:00")
     parser.add_argument("--iteration-selection-end", default="2024-04-01 01:00:00")
     parser.add_argument("--comparison-start", default="2024-10-01 01:00:00")
+
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--n-jobs", type=int, default=-1)
     parser.add_argument("--max-epochs", type=int, default=200)
@@ -105,6 +105,7 @@ def parse_args() -> PipelineConfig:
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-5)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=0.02)
+
     parser.add_argument("--ficr-weight", type=float, default=0.75)
     parser.add_argument("--ficr-temperature", type=float, default=0.01)
     parser.add_argument(
@@ -151,7 +152,6 @@ def parse_args() -> PipelineConfig:
             "distillation."
         ),
     )
-
     parser.add_argument(
         "--student-history-hours",
         type=int,
@@ -197,19 +197,60 @@ def parse_args() -> PipelineConfig:
         dest="temporal_prediction_correction",
         action="store_true",
         default=False,
-        help="Enable the legacy 12-hour base-prediction correction model.",
+        help="Enable the legacy base-prediction correction model.",
     )
     parser.add_argument(
         "--correction-validation-start",
         default="2024-07-01 01:00:00",
     )
     parser.add_argument("--temporal-oof-year", type=int, default=2024)
+
     parser.add_argument(
         "--ficr-boundary-consistency-weight",
         type=float,
         default=0.0,
     )
     parser.add_argument("--activity-loss-weight", type=float, default=0.15)
+
+    # G3 residual CLI.
+    parser.add_argument(
+        "--enable-group3-residual",
+        dest="group3_residual",
+        action="store_true",
+        default=False,
+        help=(
+            "Train a second-stage RealMLP on kpx_group_3 residuals from "
+            "base validation predictions and apply it only to group 3."
+        ),
+    )
+    parser.add_argument(
+        "--group3-residual-validation-start",
+        default="2024-07-01 01:00:00",
+        help=(
+            "Residual model train/validation boundary. Residual train uses "
+            "[validation_start, this timestamp); residual validation uses "
+            "[this timestamp, comparison_start)."
+        ),
+    )
+    parser.add_argument("--group3-residual-epochs", type=int, default=80)
+    parser.add_argument("--group3-residual-ensemble", type=int, default=8)
+    parser.add_argument(
+        "--group3-residual-learning-rate",
+        type=float,
+        default=0.02,
+    )
+    parser.add_argument(
+        "--group3-residual-batch-size",
+        type=int,
+        default=256,
+    )
+    parser.add_argument(
+        "--group3-residual-max-abs-correction",
+        type=float,
+        default=0.20,
+        help="Maximum absolute correction in capacity-factor units.",
+    )
+
     parser.add_argument("--device", default=None, help="cpu, cuda, or omit for auto")
     parser.add_argument("--evaluation-only", action="store_true")
 
@@ -224,12 +265,13 @@ def parse_args() -> PipelineConfig:
         "teacher_oof_folds",
         "teacher_min_train_rows",
         "teacher_epochs",
+        "group3_residual_epochs",
+        "group3_residual_ensemble",
+        "group3_residual_batch_size",
     )
     for option in positive_options:
         if values[option] < 1:
-            parser.error(
-                f"--{option.replace('_', '-')} must be at least 1."
-            )
+            parser.error(f"--{option.replace('_', '-')} must be at least 1.")
 
     if values["early_stopping_min_delta"] < 0.0:
         parser.error("--early-stopping-min-delta must be non-negative.")
@@ -258,13 +300,32 @@ def parse_args() -> PipelineConfig:
     if not 0.0 < values["history_decay"] <= 1.0:
         parser.error("--history-decay must be in (0, 1].")
 
+    if values["group3_residual_learning_rate"] <= 0.0:
+        parser.error("--group3-residual-learning-rate must be positive.")
+    if not 0.0 < values["group3_residual_max_abs_correction"] <= 1.0:
+        parser.error(
+            "--group3-residual-max-abs-correction must be in (0, 1]."
+        )
+
+    validation_start = pd.Timestamp(values["validation_start"])
+    comparison_start = pd.Timestamp(values["comparison_start"])
+    residual_validation_start = pd.Timestamp(
+        values["group3_residual_validation_start"]
+    )
+    if values["group3_residual"] and not (
+        validation_start < residual_validation_start < comparison_start
+    ):
+        parser.error(
+            "--validation-start < --group3-residual-validation-start "
+            "< --comparison-start is required."
+        )
+
     if values["temporal_group_dro"] and values["ficr_loss"] != "sigmoid":
         parser.error("--temporal-group-dro requires --ficr-loss sigmoid.")
 
     if values["temporal_group_dro"] and values["group3_reliability_weighting"]:
         parser.error(
-            "--temporal-group-dro cannot be combined with group 3 reliability; "
-            "do not enable group 3 reliability weighting."
+            "--temporal-group-dro cannot be combined with group 3 reliability."
         )
 
     if values["group3_stacking"] and values["group3_reliability_weighting"]:
@@ -312,7 +373,7 @@ def parse_args() -> PipelineConfig:
     if values["temporal_prediction_correction"] and not (
         pd.Timestamp(values["iteration_selection_end"])
         < correction_start
-        < pd.Timestamp(values["comparison_start"])
+        < comparison_start
     ):
         parser.error(
             "--iteration-selection-end < --correction-validation-start "
@@ -324,30 +385,20 @@ def parse_args() -> PipelineConfig:
         models = DEFAULT_MODEL_NAMES
     elif "all" in requested_models:
         if requested_models != ["all"]:
-            parser.error(
-                "--models all cannot be combined with another model name."
-            )
+            parser.error("--models all cannot be combined with another model name.")
         models = SUPPORTED_MODEL_NAMES
     else:
         models = tuple(dict.fromkeys(requested_models))
 
     output_dir = values.pop("output_dir")
     if output_dir is None:
-        if values["teacher_student_distillation"]:
-            output_dir = (
-                Path("model_outputs/v7/temporal_x_5h_teacher_y_5h_distillation/runs")
-                / "_".join(models)
-            )
-        elif values["temporal_prediction_correction"]:
-            output_dir = (
-                Path("model_outputs/v5/temporal_oof_correction_lr_0p02/runs")
-                / "_".join(models)
-            )
-        else:
-            output_dir = (
-                Path("model_outputs/direct_realmlp/runs")
-                / "_".join(models)
-            )
+        # Keep this experiment under Version 6.
+        suffix = (
+            "temporal_x_5h_teacher_y_5h_g3_residual"
+            if values["group3_residual"]
+            else "temporal_x_5h_teacher_y_5h_distillation"
+        )
+        output_dir = Path("model_outputs/v6") / suffix / "runs" / "_".join(models)
 
     return PipelineConfig(
         models=models,
