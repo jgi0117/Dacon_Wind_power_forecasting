@@ -9,3 +9,4 @@ kditransform
 hyperopt
 openpyxl>=3.1
 huggingface-hub
+pyarrow
