@@ -11,6 +11,7 @@ systematic G3 calibration error can be corrected without changing G1/G2.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -25,6 +26,9 @@ LOGGER = logging.getLogger("baram.pipeline")
 
 G3_TARGET = "kpx_group_3"
 
+_RESIDUAL_TRAIN_LOSS = "baram_g3_residual_train_mse"
+_RESIDUAL_VAL_LOSS = "baram_g3_residual_val_mse"
+
 
 class Group3ResidualRealMLP:
     def __init__(
@@ -34,29 +38,25 @@ class Group3ResidualRealMLP:
         epochs: int | None = None,
     ) -> None:
         self.config = config
+
         self.epochs = int(
-            epochs or config.group3_residual_epochs
+            epochs
+            or config.group3_residual_epochs
         )
 
         self.model: Any | None = None
         self.elapsed_seconds = 0.0
+
+        self.training_history: list[
+            dict[str, float | int]
+        ] = []
 
     @staticmethod
     def build_features(
         X: pd.DataFrame,
         base_prediction_kw: pd.Series,
     ) -> pd.DataFrame:
-        """
-        Add leakage-free base prediction and calendar context.
-
-        Residual features:
-        - original X
-        - base G3 capacity-factor prediction
-        - squared base G3 prediction
-        - cyclic month
-        - cyclic hour
-        - cyclic day-of-year
-        """
+        """Build leakage-free G3 residual features."""
 
         prediction = pd.Series(
             base_prediction_kw,
@@ -70,8 +70,8 @@ class Group3ResidualRealMLP:
             )
 
             raise ValueError(
-                "G3 residual base prediction is missing "
-                f"for {missing} rows."
+                "G3 residual base prediction "
+                f"is missing for {missing} rows."
             )
 
         features = X.copy()
@@ -85,12 +85,7 @@ class Group3ResidualRealMLP:
             "g3_residual__base_prediction_cf"
         ] = base_cf
 
-        # pandas 2.x / 3.x compatible.
-        #
-        # Do not use:
-        #     base_cf.square()
-        #
-        # pandas 2.3.3 does not expose Series.square().
+        # pandas 2.x / 3.x compatible
         features[
             "g3_residual__base_prediction_cf_sq"
         ] = base_cf ** 2
@@ -102,35 +97,47 @@ class Group3ResidualRealMLP:
         month = index.month.to_numpy(
             dtype=float
         )
+
         hour = index.hour.to_numpy(
             dtype=float
         )
-        dayofyear = index.dayofyear.to_numpy(
-            dtype=float
+
+        dayofyear = (
+            index.dayofyear.to_numpy(
+                dtype=float
+            )
         )
 
         features[
             "g3_residual__month_sin"
         ] = np.sin(
-            2.0 * np.pi * month / 12.0
+            2.0 * np.pi
+            * month
+            / 12.0
         )
 
         features[
             "g3_residual__month_cos"
         ] = np.cos(
-            2.0 * np.pi * month / 12.0
+            2.0 * np.pi
+            * month
+            / 12.0
         )
 
         features[
             "g3_residual__hour_sin"
         ] = np.sin(
-            2.0 * np.pi * hour / 24.0
+            2.0 * np.pi
+            * hour
+            / 24.0
         )
 
         features[
             "g3_residual__hour_cos"
         ] = np.cos(
-            2.0 * np.pi * hour / 24.0
+            2.0 * np.pi
+            * hour
+            / 24.0
         )
 
         features[
@@ -156,13 +163,7 @@ class Group3ResidualRealMLP:
         actual_kw: pd.Series,
         base_prediction_kw: pd.Series,
     ) -> pd.Series:
-        """
-        Residual target in capacity-factor units.
-
-        residual_cf =
-            actual_group3_cf
-            - base_group3_prediction_cf
-        """
+        """Residual target in capacity-factor units."""
 
         actual_cf = (
             actual_kw.astype(float)
@@ -200,11 +201,15 @@ class Group3ResidualRealMLP:
             RealMLP_TD_Regressor,
         )
 
+        from pytabkit.models.training.metrics import (
+            Metrics,
+        )
+
         started = time.perf_counter()
 
-        # -----------------------------------------------------
-        # Train
-        # -----------------------------------------------------
+        # =====================================================
+        # Train data
+        # =====================================================
 
         train_features = (
             self.build_features(
@@ -215,7 +220,9 @@ class Group3ResidualRealMLP:
 
         train_target = (
             self.residual_target(
-                actual_kw.reindex(X.index),
+                actual_kw.reindex(
+                    X.index
+                ),
                 base_prediction_kw.reindex(
                     X.index
                 ),
@@ -246,8 +253,6 @@ class Group3ResidualRealMLP:
                 "G3 residual training."
             )
 
-        # Avoid logging thousands of feature names.
-        # Only report useful dimensions.
         LOGGER.info(
             "G3 residual train prepared: "
             "rows=%d, features=%d",
@@ -255,16 +260,20 @@ class Group3ResidualRealMLP:
             train_features.shape[1],
         )
 
+        # =====================================================
+        # Validation data
+        # =====================================================
+
         fit_kwargs: dict[
             str,
             Any,
         ] = {}
 
-        # -----------------------------------------------------
-        # Validation
-        # -----------------------------------------------------
+        has_validation = (
+            X_valid is not None
+        )
 
-        if X_valid is not None:
+        if has_validation:
 
             if (
                 base_prediction_valid_kw
@@ -273,9 +282,8 @@ class Group3ResidualRealMLP:
                 is None
             ):
                 raise ValueError(
-                    "Residual validation "
-                    "requires base prediction "
-                    "and actual y."
+                    "Residual validation requires "
+                    "base prediction and actual y."
                 )
 
             valid_features = (
@@ -320,10 +328,13 @@ class Group3ResidualRealMLP:
                     "G3 residual validation."
                 )
 
-            if list(
-                train_features.columns
-            ) != list(
-                valid_features.columns
+            if (
+                list(
+                    train_features.columns
+                )
+                != list(
+                    valid_features.columns
+                )
             ):
                 raise ValueError(
                     "G3 residual train/validation "
@@ -342,18 +353,157 @@ class Group3ResidualRealMLP:
                 "y_val": valid_target,
             }
 
-        # -----------------------------------------------------
+        # =====================================================
+        # CPU threads
+        # =====================================================
+
+        n_threads = (
+            os.cpu_count() or 1
+            if self.config.n_jobs < 1
+            else self.config.n_jobs
+        )
+
+        if n_threads < 1:
+            n_threads = 1
+
+        # =====================================================
+        # Custom metric logging
+        #
+        # verbosity=0 suppresses PyTabKit's very long feature
+        # output. Epoch losses are logged here instead.
+        # =====================================================
+
+        original_apply = Metrics.apply
+
+        epoch_train_losses: list[
+            float
+        ] = []
+
+        self.training_history = []
+
+        def residual_metric_apply(
+            y_pred: Any,
+            actual: Any,
+            metric_name: str,
+        ) -> Any:
+            import torch
+
+            if metric_name not in {
+                _RESIDUAL_TRAIN_LOSS,
+                _RESIDUAL_VAL_LOSS,
+            }:
+                return original_apply(
+                    y_pred,
+                    actual,
+                    metric_name,
+                )
+
+            prediction = y_pred
+            target = actual
+
+            if target.ndim < prediction.ndim:
+                target = (
+                    target.unsqueeze(0)
+                    .expand_as(prediction)
+                )
+
+            elif prediction.ndim < target.ndim:
+                prediction = (
+                    prediction.unsqueeze(0)
+                    .expand_as(target)
+                )
+
+            squared_error = (
+                prediction
+                - target
+            ) ** 2
+
+            loss = (
+                squared_error.mean()
+            )
+
+            scalar_loss = float(
+                loss.detach()
+                .mean()
+                .cpu()
+            )
+
+            if (
+                metric_name
+                == _RESIDUAL_TRAIN_LOSS
+            ):
+                epoch_train_losses.append(
+                    scalar_loss
+                )
+
+                return loss
+
+            # Validation metric is evaluated once
+            # per epoch after train metric calls.
+            train_loss = (
+                float(
+                    np.mean(
+                        epoch_train_losses
+                    )
+                )
+                if epoch_train_losses
+                else float("nan")
+            )
+
+            epoch = (
+                len(
+                    self.training_history
+                )
+                + 1
+            )
+
+            history = {
+                "epoch": epoch,
+                "train_loss": (
+                    train_loss
+                ),
+                "validation_loss": (
+                    scalar_loss
+                ),
+            }
+
+            self.training_history.append(
+                history
+            )
+
+            LOGGER.info(
+                "G3 Residual epoch "
+                "%03d/%03d | "
+                "train_loss=%.8f | "
+                "val_loss=%.8f",
+                epoch,
+                self.epochs,
+                train_loss,
+                scalar_loss,
+            )
+
+            epoch_train_losses.clear()
+
+            return loss
+
+        Metrics.apply = staticmethod(
+            residual_metric_apply
+        )
+
+        # =====================================================
         # Model
-        # -----------------------------------------------------
+        # =====================================================
 
         LOGGER.info(
             "G3 residual RealMLP fit: "
             "epochs=%d, ensemble=%d, "
-            "batch_size=%d, lr=%.5f",
+            "batch_size=%d, lr=%.5f, "
+            "n_threads=%d",
             self.epochs,
             self.config.group3_residual_ensemble,
             self.config.group3_residual_batch_size,
             self.config.group3_residual_learning_rate,
+            n_threads,
         )
 
         self.model = (
@@ -366,7 +516,7 @@ class Group3ResidualRealMLP:
                     self.config.seed
                 ),
                 n_threads=(
-                    self.config.n_jobs
+                    n_threads
                 ),
                 n_epochs=(
                     self.epochs
@@ -396,17 +546,47 @@ class Group3ResidualRealMLP:
                 p_drop=0.15,
                 opt="adam",
 
-                # Keep useful training logs,
-                # but suppress verbose feature/schema dump.
+                # Custom loss names so that
+                # residual_metric_apply() receives
+                # per-epoch train/validation calls.
+                train_metric_name=(
+                    _RESIDUAL_TRAIN_LOSS
+                ),
+                val_metric_name=(
+                    _RESIDUAL_VAL_LOSS
+                ),
+
+                use_early_stopping=False,
+
+                # When no explicit validation set
+                # exists (final residual refit),
+                # train exactly self.epochs.
+                stop_epoch=(
+                    None
+                    if has_validation
+                    else self.epochs
+                ),
+
+                # IMPORTANT:
+                # Suppress PyTabKit feature dump.
+                # Epoch loss is logged manually above.
                 verbosity=0,
             )
         )
 
-        self.model.fit(
-            train_features,
-            train_target,
-            **fit_kwargs,
-        )
+        try:
+            self.model.fit(
+                train_features,
+                train_target,
+                **fit_kwargs,
+            )
+
+        finally:
+            # Never leave global PyTabKit metric
+            # monkeypatch active after this model.
+            Metrics.apply = staticmethod(
+                original_apply
+            )
 
         self.elapsed_seconds = (
             time.perf_counter()
@@ -450,7 +630,8 @@ class Group3ResidualRealMLP:
         if len(correction) != len(X):
             raise ValueError(
                 "G3 residual prediction length "
-                f"mismatch: {len(correction)} "
+                f"mismatch: "
+                f"{len(correction)} "
                 f"!= {len(X)}"
             )
 
@@ -458,8 +639,8 @@ class Group3ResidualRealMLP:
             correction
         ).all():
             raise ValueError(
-                "G3 residual prediction contains "
-                "NaN or infinite values."
+                "G3 residual prediction "
+                "contains NaN or infinite values."
             )
 
         limit = float(
@@ -513,7 +694,8 @@ class Group3ResidualRealMLP:
         )
 
         corrected_cf = np.clip(
-            base_cf + correction,
+            base_cf
+            + correction,
             0.0,
             1.0,
         )
@@ -535,8 +717,12 @@ class Group3ResidualRealMLP:
             "model": (
                 "Group3ResidualRealMLP"
             ),
-            "target": G3_TARGET,
-            "epochs": self.epochs,
+            "target": (
+                G3_TARGET
+            ),
+            "epochs": (
+                self.epochs
+            ),
             "ensemble": (
                 self.config
                 .group3_residual_ensemble
@@ -563,5 +749,8 @@ class Group3ResidualRealMLP:
             "feature_definition": (
                 "raw X + base G3 prediction "
                 "+ cyclic calendar features"
+            ),
+            "epoch_loss_history": (
+                self.training_history
             ),
         }

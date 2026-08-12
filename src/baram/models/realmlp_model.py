@@ -24,10 +24,14 @@ from .base import RegressionModel
 
 
 LOGGER = logging.getLogger('baram.pipeline')
+
 _TRAIN_FICR_LOSS = 'baram_train_ficr_aware_loss'
 _VAL_FICR_LOSS = 'baram_val_ficr_aware_loss'
+
 _MISSING_TARGET = -1.0
 _ACTIVITY_CODES_PER_BLOCK = 3
+
+
 _REALMLP_TD_REG_PARAMS = {
     'hidden_sizes': [256] * 3,
     'max_one_hot_cat_size': 9,
@@ -47,580 +51,2076 @@ _REALMLP_TD_REG_PARAMS = {
     'p_drop_sched': 'flat_cos',
     'add_front_scale': True,
     'scale_lr_factor': 6.0,
-    'tfms': ['one_hot', 'median_center', 'robust_scale', 'smooth_clip', 'embedding'],
+    'tfms': [
+        'one_hot',
+        'median_center',
+        'robust_scale',
+        'smooth_clip',
+        'embedding',
+    ],
     'num_emb_type': 'pbld',
     'plr_sigma': 0.1,
     'plr_hidden_1': 16,
     'plr_hidden_2': 4,
     'plr_lr_factor': 0.1,
-    # NaN-masked multi-task targets make data-derived clamp bounds invalid.
-    # Predictions are clipped to [0, 1] when restored to generation units.
+
+    # NaN-masked multi-task targets make
+    # data-derived clamp bounds invalid.
+    # Predictions are clipped to [0, 1]
+    # when restored to generation units.
     'clamp_output': False,
+
     'opt': 'adam',
     'sq_mom': 0.95,
 }
 
 
-def _quarter_block_ids(index: pd.Index):
+def _quarter_block_ids(
+    index: pd.Index,
+):
     '''Return compact chronological quarter IDs for loss-only metadata.'''
-    timestamps = pd.DatetimeIndex(index)
-    quarter_keys = timestamps.year.astype(np.int64) * 4 + timestamps.quarter - 1
-    unique_keys = sorted(np.unique(quarter_keys).tolist())
-    key_to_id = {key: block_id for block_id, key in enumerate(unique_keys)}
-    ids = np.asarray(
-        [key_to_id[int(key)] for key in quarter_keys], dtype=np.float32
+
+    timestamps = pd.DatetimeIndex(
+        index
     )
-    labels = {
-        block_id: f'{key // 4}Q{key % 4 + 1}'
-        for key, block_id in key_to_id.items()
+
+    quarter_keys = (
+        timestamps.year.astype(
+            np.int64
+        )
+        * 4
+        + timestamps.quarter
+        - 1
+    )
+
+    unique_keys = sorted(
+        np.unique(
+            quarter_keys
+        ).tolist()
+    )
+
+    key_to_id = {
+        key: block_id
+        for block_id, key
+        in enumerate(
+            unique_keys
+        )
     }
+
+    ids = np.asarray(
+        [
+            key_to_id[
+                int(key)
+            ]
+            for key in quarter_keys
+        ],
+        dtype=np.float32,
+    )
+
+    labels = {
+        block_id: (
+            f'{key // 4}'
+            f'Q{key % 4 + 1}'
+        )
+        for key, block_id
+        in key_to_id.items()
+    }
+
     return ids, labels
 
 
-def _pack_activity_block_metadata(activity, block_ids):
-    '''Pack block ID into the first activity label without adding an output.'''
-    packed = np.array(activity, dtype=np.float32, copy=True)
+def _pack_activity_block_metadata(
+    activity,
+    block_ids,
+):
+    '''Pack block ID into first activity label without adding output.'''
+
+    packed = np.array(
+        activity,
+        dtype=np.float32,
+        copy=True,
+    )
+
     first_code = np.where(
-        packed[:, 0] < 0.0, 2.0, packed[:, 0]
-    ).astype(np.float32)
-    packed[:, 0] = _ACTIVITY_CODES_PER_BLOCK * block_ids + first_code
+        packed[:, 0] < 0.0,
+        2.0,
+        packed[:, 0],
+    ).astype(
+        np.float32
+    )
+
+    packed[:, 0] = (
+        _ACTIVITY_CODES_PER_BLOCK
+        * block_ids
+        + first_code
+    )
+
     return packed
 
 
-def _unpack_activity_block_metadata(packed):
-    '''Decode original activity labels and temporal IDs inside the loss.'''
+def _unpack_activity_block_metadata(
+    packed,
+):
+    '''Decode original activity labels and temporal IDs inside loss.'''
+
     import torch
 
     encoded = packed[..., 0]
+
     block_ids = torch.div(
-        encoded, _ACTIVITY_CODES_PER_BLOCK, rounding_mode='floor'
+        encoded,
+        _ACTIVITY_CODES_PER_BLOCK,
+        rounding_mode='floor',
     )
-    first_code = torch.remainder(encoded, _ACTIVITY_CODES_PER_BLOCK)
+
+    first_code = torch.remainder(
+        encoded,
+        _ACTIVITY_CODES_PER_BLOCK,
+    )
+
     activity = packed.clone()
+
     activity[..., 0] = torch.where(
         first_code == 2.0,
-        torch.full_like(first_code, _MISSING_TARGET),
+        torch.full_like(
+            first_code,
+            _MISSING_TARGET,
+        ),
         first_code,
     )
-    return activity, block_ids
+
+    return (
+        activity,
+        block_ids,
+    )
 
 
-def _pack_reliability_metadata(activity, reliability):
+def _pack_reliability_metadata(
+    activity,
+    reliability,
+):
     '''Pack continuous per-target weights into activity target fractions.'''
-    integer_codes = np.where(activity < 0.0, 2.0, activity).astype(np.float32)
-    return integer_codes + 0.1 * np.asarray(reliability, dtype=np.float32)
+
+    integer_codes = np.where(
+        activity < 0.0,
+        2.0,
+        activity,
+    ).astype(
+        np.float32
+    )
+
+    return (
+        integer_codes
+        + 0.1
+        * np.asarray(
+            reliability,
+            dtype=np.float32,
+        )
+    )
 
 
-def _unpack_reliability_metadata(packed):
-    '''Recover activity codes and continuous reliability weights in the loss.'''
+def _unpack_reliability_metadata(
+    packed,
+):
+    '''Recover activity codes and continuous reliability weights in loss.'''
+
     import torch
 
-    integer_codes = torch.floor(packed + 1e-5)
-    reliability = ((packed - integer_codes) * 10.0).clamp(0.0, 1.0)
-    return integer_codes, reliability
+    integer_codes = torch.floor(
+        packed + 1e-5
+    )
+
+    reliability = (
+        (
+            packed
+            - integer_codes
+        )
+        * 10.0
+    ).clamp(
+        0.0,
+        1.0,
+    )
+
+    return (
+        integer_codes,
+        reliability,
+    )
 
 
-def _competition_score_loss(y_pred: Any, y: Any) -> Any:
+def _competition_score_loss(
+    y_pred: Any,
+    y: Any,
+) -> Any:
+
     import torch
 
     prediction = y_pred
     actual = y
-    if actual.ndim < prediction.ndim:
-        actual = actual.unsqueeze(0).expand_as(prediction)
-    elif prediction.ndim < actual.ndim:
-        prediction = prediction.unsqueeze(0).expand_as(actual)
+
+    if (
+        actual.ndim
+        < prediction.ndim
+    ):
+        actual = (
+            actual
+            .unsqueeze(0)
+            .expand_as(
+                prediction
+            )
+        )
+
+    elif (
+        prediction.ndim
+        < actual.ndim
+    ):
+        prediction = (
+            prediction
+            .unsqueeze(0)
+            .expand_as(
+                actual
+            )
+        )
+
     if actual.ndim < 2:
-        actual = actual.reshape(-1, 1)
-        prediction = prediction.reshape(-1, 1)
-    valid = torch.isfinite(actual) & torch.isfinite(prediction) & (actual >= 0.10)
-    safe_actual = torch.where(valid, actual, torch.zeros_like(actual))
+        actual = actual.reshape(
+            -1,
+            1,
+        )
+
+        prediction = (
+            prediction.reshape(
+                -1,
+                1,
+            )
+        )
+
+    valid = (
+        torch.isfinite(actual)
+        & torch.isfinite(
+            prediction
+        )
+        & (
+            actual >= 0.10
+        )
+    )
+
+    safe_actual = torch.where(
+        valid,
+        actual,
+        torch.zeros_like(
+            actual
+        ),
+    )
+
     safe_prediction = torch.where(
-        valid, prediction.clamp(0.0, 1.0), torch.zeros_like(prediction)
+        valid,
+        prediction.clamp(
+            0.0,
+            1.0,
+        ),
+        torch.zeros_like(
+            prediction
+        ),
     )
-    error = (safe_prediction - safe_actual).abs()
-    valid_float = valid.to(error.dtype)
-    count = valid_float.sum(dim=-2)
-    safe_count = count.clamp_min(1.0)
-    nmae = (error * valid_float).sum(dim=-2) / safe_count
+
+    error = (
+        safe_prediction
+        - safe_actual
+    ).abs()
+
+    valid_float = valid.to(
+        error.dtype
+    )
+
+    count = valid_float.sum(
+        dim=-2
+    )
+
+    safe_count = count.clamp_min(
+        1.0
+    )
+
+    nmae = (
+        (
+            error
+            * valid_float
+        ).sum(
+            dim=-2
+        )
+        / safe_count
+    )
+
     unit_price = torch.where(
-        error <= 0.06, 4.0, torch.where(error <= 0.08, 3.0, 0.0)
+        error <= 0.06,
+        4.0,
+        torch.where(
+            error <= 0.08,
+            3.0,
+            0.0,
+        ),
     )
-    numerator = (safe_actual * unit_price * valid_float).sum(dim=-2)
-    denominator = (safe_actual * 4.0 * valid_float).sum(dim=-2)
-    ficr = numerator / denominator.clamp_min(1e-12)
-    group_score = 0.5 * (1.0 - nmae) + 0.5 * ficr
-    valid_groups = count > 0
-    valid_group_count = valid_groups.sum(dim=-1).clamp_min(1)
+
+    numerator = (
+        safe_actual
+        * unit_price
+        * valid_float
+    ).sum(
+        dim=-2
+    )
+
+    denominator = (
+        safe_actual
+        * 4.0
+        * valid_float
+    ).sum(
+        dim=-2
+    )
+
+    ficr = (
+        numerator
+        / denominator.clamp_min(
+            1e-12
+        )
+    )
+
+    group_score = (
+        0.5
+        * (
+            1.0
+            - nmae
+        )
+        + 0.5
+        * ficr
+    )
+
+    valid_groups = (
+        count > 0
+    )
+
+    valid_group_count = (
+        valid_groups
+        .sum(
+            dim=-1
+        )
+        .clamp_min(1)
+    )
+
     score = (
-        torch.where(valid_groups, group_score, torch.zeros_like(group_score))
-        .sum(dim=-1)
+        torch.where(
+            valid_groups,
+            group_score,
+            torch.zeros_like(
+                group_score
+            ),
+        )
+        .sum(
+            dim=-1
+        )
         / valid_group_count
     )
+
     return -score
 
 
-def _competition_components(y_pred: Any, y: Any) -> tuple[Any, Any]:
+def _competition_components(
+    y_pred: Any,
+    y: Any,
+) -> tuple[Any, Any]:
     '''Return exact group-averaged NMAE and FICR tensors.'''
+
     import torch
 
     prediction = y_pred
     actual = y
-    if actual.ndim < prediction.ndim:
-        actual = actual.unsqueeze(0).expand_as(prediction)
-    elif prediction.ndim < actual.ndim:
-        prediction = prediction.unsqueeze(0).expand_as(actual)
-    valid = torch.isfinite(actual) & torch.isfinite(prediction) & (actual >= 0.10)
-    safe_actual = torch.where(valid, actual, torch.zeros_like(actual))
+
+    if (
+        actual.ndim
+        < prediction.ndim
+    ):
+        actual = (
+            actual
+            .unsqueeze(0)
+            .expand_as(
+                prediction
+            )
+        )
+
+    elif (
+        prediction.ndim
+        < actual.ndim
+    ):
+        prediction = (
+            prediction
+            .unsqueeze(0)
+            .expand_as(
+                actual
+            )
+        )
+
+    valid = (
+        torch.isfinite(actual)
+        & torch.isfinite(
+            prediction
+        )
+        & (
+            actual >= 0.10
+        )
+    )
+
+    safe_actual = torch.where(
+        valid,
+        actual,
+        torch.zeros_like(
+            actual
+        ),
+    )
+
     safe_prediction = torch.where(
-        valid, prediction.clamp(0.0, 1.0), torch.zeros_like(prediction)
+        valid,
+        prediction.clamp(
+            0.0,
+            1.0,
+        ),
+        torch.zeros_like(
+            prediction
+        ),
     )
-    error = (safe_prediction - safe_actual).abs()
-    valid_float = valid.to(error.dtype)
-    count = valid_float.sum(dim=-2)
-    nmae = (error * valid_float).sum(dim=-2) / count.clamp_min(1.0)
+
+    error = (
+        safe_prediction
+        - safe_actual
+    ).abs()
+
+    valid_float = valid.to(
+        error.dtype
+    )
+
+    count = valid_float.sum(
+        dim=-2
+    )
+
+    nmae = (
+        (
+            error
+            * valid_float
+        ).sum(
+            dim=-2
+        )
+        / count.clamp_min(
+            1.0
+        )
+    )
+
     unit_price = torch.where(
-        error <= 0.06, 4.0, torch.where(error <= 0.08, 3.0, 0.0)
+        error <= 0.06,
+        4.0,
+        torch.where(
+            error <= 0.08,
+            3.0,
+            0.0,
+        ),
     )
-    ficr = (safe_actual * unit_price * valid_float).sum(dim=-2) / (
-        safe_actual * 4.0 * valid_float
-    ).sum(dim=-2).clamp_min(1e-12)
-    valid_groups = count > 0
-    divisor = valid_groups.sum(dim=-1).clamp_min(1)
-    mean_nmae = torch.where(valid_groups, nmae, 0.0).sum(dim=-1) / divisor
-    mean_ficr = torch.where(valid_groups, ficr, 0.0).sum(dim=-1) / divisor
-    return mean_nmae, mean_ficr
+
+    ficr = (
+        (
+            safe_actual
+            * unit_price
+            * valid_float
+        ).sum(
+            dim=-2
+        )
+        /
+        (
+            safe_actual
+            * 4.0
+            * valid_float
+        )
+        .sum(
+            dim=-2
+        )
+        .clamp_min(
+            1e-12
+        )
+    )
+
+    valid_groups = (
+        count > 0
+    )
+
+    divisor = (
+        valid_groups
+        .sum(
+            dim=-1
+        )
+        .clamp_min(1)
+    )
+
+    mean_nmae = (
+        torch.where(
+            valid_groups,
+            nmae,
+            0.0,
+        )
+        .sum(
+            dim=-1
+        )
+        / divisor
+    )
+
+    mean_ficr = (
+        torch.where(
+            valid_groups,
+            ficr,
+            0.0,
+        )
+        .sum(
+            dim=-1
+        )
+        / divisor
+    )
+
+    return (
+        mean_nmae,
+        mean_ficr,
+    )
 
 
-class RealMLPModel(RegressionModel):
-    def __init__(self, config: PipelineConfig, epochs: int | None = None) -> None:
+class RealMLPModel(
+    RegressionModel,
+):
+
+    def __init__(
+        self,
+        config: PipelineConfig,
+        epochs: int | None = None,
+    ) -> None:
+
         self.config = config
-        self.epochs = int(epochs or config.max_epochs)
-        self.best_iteration = self.epochs
-        self.model: Any | None = None
-        self.elapsed_seconds = 0.0
+
+        self.epochs = int(
+            epochs
+            or config.max_epochs
+        )
+
+        self.best_iteration = (
+            self.epochs
+        )
+
+        self.model: Any | None = (
+            None
+        )
+
+        self.elapsed_seconds = (
+            0.0
+        )
+
         self.device = 'cpu'
+
         self.n_threads = 1
-        self.early_stopping_enabled = False
-        self.training_history: list[dict[str, Any]] = []
-        self.target_names = list(TARGET_COLS)
-        self.temporal_block_weights: dict[str, float] = {}
-        self.group3_reliability_metadata: dict[str, Any] = {}
+
+        self.early_stopping_enabled = (
+            False
+        )
+
+        self.training_history: list[
+            dict[str, Any]
+        ] = []
+
+        self.target_names = list(
+            TARGET_COLS
+        )
+
+        self.temporal_block_weights: dict[
+            str,
+            float,
+        ] = {}
+
+        self.group3_reliability_metadata: dict[
+            str,
+            Any,
+        ] = {}
 
     def fit(
-        self, X: pd.DataFrame, y: pd.DataFrame | pd.Series,
+        self,
+        X: pd.DataFrame,
+        y: pd.DataFrame | pd.Series,
         X_valid: pd.DataFrame | None = None,
         y_valid: pd.DataFrame | pd.Series | None = None,
     ) -> 'RealMLPModel':
-        from pytabkit import RealMLP_TD_Regressor
-        from pytabkit.models.training.metrics import Metrics
 
-        started = time.perf_counter()
-        self.device = self.config.device or 'cpu'
+        from pytabkit import (
+            RealMLP_TD_Regressor,
+        )
+
+        from pytabkit.models.training.metrics import (
+            Metrics,
+        )
+
+        started = (
+            time.perf_counter()
+        )
+
+        self.device = (
+            self.config.device
+            or 'cpu'
+        )
+
+        # PyTorch requires a positive thread count.
         self.n_threads = (
-            os.cpu_count() or 1
+            os.cpu_count()
+            or 1
             if self.config.n_jobs < 1
             else self.config.n_jobs
         )
-        original_apply = Metrics.apply
-        epoch_train_losses: list[float] = []
-        epoch_objective_train_losses: list[float] = []
-        epoch_activity_train_losses: list[float] = []
-        epoch_boundary_consistency_losses: list[float] = []
-        epoch_group_train_losses: dict[str, list[float]] = {}
-        if isinstance(y, pd.DataFrame):
-            self.target_names = [str(column) for column in y.columns]
+
+        if self.n_threads < 1:
+            self.n_threads = 1
+
+        original_apply = (
+            Metrics.apply
+        )
+
+        epoch_train_losses: list[
+            float
+        ] = []
+
+        epoch_objective_train_losses: list[
+            float
+        ] = []
+
+        epoch_activity_train_losses: list[
+            float
+        ] = []
+
+        epoch_boundary_consistency_losses: list[
+            float
+        ] = []
+
+        epoch_group_train_losses: dict[
+            str,
+            list[float],
+        ] = {}
+
+        if isinstance(
+            y,
+            pd.DataFrame,
+        ):
+            self.target_names = [
+                str(column)
+                for column
+                in y.columns
+            ]
+
         else:
-            self.target_names = [str(y.name or TARGET_COLS[0])]
-        epoch_group_train_losses = {target: [] for target in self.target_names}
-        block_ids, temporal_block_labels = _quarter_block_ids(X.index)
-        dro_log_weights = {key: 0.0 for key in temporal_block_labels}
-        epoch_temporal_losses = {
-            key: [] for key in temporal_block_labels
+            self.target_names = [
+                str(
+                    y.name
+                    or TARGET_COLS[0]
+                )
+            ]
+
+        epoch_group_train_losses = {
+            target: []
+            for target
+            in self.target_names
         }
 
-        def normalized_dro_weights() -> dict[int, float]:
-            maximum = max(dro_log_weights.values())
+        (
+            block_ids,
+            temporal_block_labels,
+        ) = _quarter_block_ids(
+            X.index
+        )
+
+        dro_log_weights = {
+            key: 0.0
+            for key
+            in temporal_block_labels
+        }
+
+        epoch_temporal_losses = {
+            key: []
+            for key
+            in temporal_block_labels
+        }
+
+        def normalized_dro_weights(
+        ) -> dict[int, float]:
+
+            maximum = max(
+                dro_log_weights.values()
+            )
+
             unscaled = {
-                key: float(np.exp(value - maximum))
-                for key, value in dro_log_weights.items()
+                key: float(
+                    np.exp(
+                        value
+                        - maximum
+                    )
+                )
+                for key, value
+                in dro_log_weights.items()
             }
-            total = sum(unscaled.values())
-            return {key: value / total for key, value in unscaled.items()}
+
+            total = sum(
+                unscaled.values()
+            )
+
+            return {
+                key: (
+                    value
+                    / total
+                )
+                for key, value
+                in unscaled.items()
+            }
 
         def capacity_objective(
-            actual: Any, prediction: Any, reliability: Any | None = None
+            actual: Any,
+            prediction: Any,
+            reliability: Any | None = None,
         ) -> Any:
-            if self.config.ficr_loss == 'relu':
-                return relu_ficr_aware_loss_torch(
-                    actual,
-                    prediction,
-                    ficr_weight=self.config.ficr_weight,
-                    margin=self.config.ficr_relu_margin,
+
+            if (
+                self.config.ficr_loss
+                == 'relu'
+            ):
+                return (
+                    relu_ficr_aware_loss_torch(
+                        actual,
+                        prediction,
+                        ficr_weight=(
+                            self.config
+                            .ficr_weight
+                        ),
+                        margin=(
+                            self.config
+                            .ficr_relu_margin
+                        ),
+                    )
                 )
+
             return ficr_aware_loss_torch(
                 actual,
                 prediction,
-                ficr_weight=self.config.ficr_weight,
-                temperature=self.config.ficr_temperature,
-                sample_weight=reliability,
+                ficr_weight=(
+                    self.config
+                    .ficr_weight
+                ),
+                temperature=(
+                    self.config
+                    .ficr_temperature
+                ),
+                sample_weight=(
+                    reliability
+                ),
             )
 
-        def score_aware_apply(y_pred: Any, actual: Any, metric_name: str) -> Any:
+        def score_aware_apply(
+            y_pred: Any,
+            actual: Any,
+            metric_name: str,
+        ) -> Any:
+
             import torch
 
-            if metric_name in {_TRAIN_FICR_LOSS, _VAL_FICR_LOSS}:
-                n_targets = len(self.target_names)
-                actual_capacity = actual[..., :n_targets]
-                predicted_capacity = y_pred[..., :n_targets]
-                actual_activity = actual[..., n_targets:2 * n_targets]
-                predicted_activity = y_pred[..., n_targets:2 * n_targets]
+            if metric_name in {
+                _TRAIN_FICR_LOSS,
+                _VAL_FICR_LOSS,
+            }:
+                n_targets = len(
+                    self.target_names
+                )
+
+                actual_capacity = (
+                    actual[
+                        ...,
+                        :n_targets
+                    ]
+                )
+
+                predicted_capacity = (
+                    y_pred[
+                        ...,
+                        :n_targets
+                    ]
+                )
+
+                actual_activity = (
+                    actual[
+                        ...,
+                        n_targets:
+                        2 * n_targets
+                    ]
+                )
+
+                predicted_activity = (
+                    y_pred[
+                        ...,
+                        n_targets:
+                        2 * n_targets
+                    ]
+                )
+
                 reliability = None
-                if self.config.group3_reliability_weighting:
-                    actual_activity, reliability = (
-                        _unpack_reliability_metadata(actual_activity)
+
+                if (
+                    self.config
+                    .group3_reliability_weighting
+                ):
+                    (
+                        actual_activity,
+                        reliability,
+                    ) = (
+                        _unpack_reliability_metadata(
+                            actual_activity
+                        )
                     )
+
                 actual_blocks = None
-                if self.config.temporal_group_dro:
-                    actual_activity, actual_blocks = (
-                        _unpack_activity_block_metadata(actual_activity)
+
+                if (
+                    self.config
+                    .temporal_group_dro
+                ):
+                    (
+                        actual_activity,
+                        actual_blocks,
+                    ) = (
+                        _unpack_activity_block_metadata(
+                            actual_activity
+                        )
                     )
-                actual_activity = torch.where(
-                    actual_activity == 2.0,
-                    torch.full_like(actual_activity, _MISSING_TARGET),
-                    actual_activity,
+
+                actual_activity = (
+                    torch.where(
+                        (
+                            actual_activity
+                            == 2.0
+                        ),
+                        torch.full_like(
+                            actual_activity,
+                            _MISSING_TARGET,
+                        ),
+                        actual_activity,
+                    )
                 )
+
                 temporal_losses = {}
+
                 use_dro = (
-                    metric_name == _TRAIN_FICR_LOSS
-                    and self.config.temporal_group_dro
-                    and self.config.ficr_loss == 'sigmoid'
+                    metric_name
+                    == _TRAIN_FICR_LOSS
+                    and self.config
+                    .temporal_group_dro
+                    and self.config
+                    .ficr_loss
+                    == 'sigmoid'
                 )
+
                 if use_dro:
-                    capacity_loss, temporal_losses = (
+                    (
+                        capacity_loss,
+                        temporal_losses,
+                    ) = (
                         temporal_group_dro_ficr_loss_torch(
                             actual_capacity,
                             predicted_capacity,
                             actual_blocks,
                             normalized_dro_weights(),
-                            ficr_weight=self.config.ficr_weight,
-                            temperature=self.config.ficr_temperature,
+                            ficr_weight=(
+                                self.config
+                                .ficr_weight
+                            ),
+                            temperature=(
+                                self.config
+                                .ficr_temperature
+                            ),
                         )
                     )
+
                 else:
-                    capacity_loss = capacity_objective(
-                        actual_capacity, predicted_capacity, reliability
+                    capacity_loss = (
+                        capacity_objective(
+                            actual_capacity,
+                            predicted_capacity,
+                            reliability,
+                        )
                     )
-                activity_loss = activity_loss_torch(
-                    actual_activity, predicted_activity
+
+                activity_loss = (
+                    activity_loss_torch(
+                        actual_activity,
+                        predicted_activity,
+                    )
                 )
-                boundary_consistency_loss = capacity_loss * 0.0
+
+                boundary_consistency_loss = (
+                    capacity_loss
+                    * 0.0
+                )
+
                 if (
-                    metric_name == _TRAIN_FICR_LOSS
-                    and self.config.ficr_boundary_consistency_weight > 0.0
+                    metric_name
+                    == _TRAIN_FICR_LOSS
+                    and self.config
+                    .ficr_boundary_consistency_weight
+                    > 0.0
                 ):
                     boundary_consistency_loss = (
                         ficr_boundary_consistency_loss_torch(
                             actual_capacity,
                             predicted_capacity,
-                            temperature=self.config.ficr_temperature,
+                            temperature=(
+                                self.config
+                                .ficr_temperature
+                            ),
                         )
                     )
+
                 value = (
                     capacity_loss
-                    + self.config.activity_loss_weight * activity_loss
-                    + self.config.ficr_boundary_consistency_weight
+                    + self.config
+                    .activity_loss_weight
+                    * activity_loss
+                    + self.config
+                    .ficr_boundary_consistency_weight
                     * boundary_consistency_loss
-                    if metric_name == _TRAIN_FICR_LOSS
+                    if (
+                        metric_name
+                        == _TRAIN_FICR_LOSS
+                    )
                     else capacity_loss
                 )
-                mean_loss = float(value.detach().mean().cpu())
-                mean_capacity_loss = float(capacity_loss.detach().mean().cpu())
-                mean_activity_loss = float(activity_loss.detach().mean().cpu())
-                mean_boundary_loss = float(
-                    boundary_consistency_loss.detach().mean().cpu()
+
+                mean_loss = float(
+                    value
+                    .detach()
+                    .mean()
+                    .cpu()
                 )
+
+                mean_capacity_loss = float(
+                    capacity_loss
+                    .detach()
+                    .mean()
+                    .cpu()
+                )
+
+                mean_activity_loss = float(
+                    activity_loss
+                    .detach()
+                    .mean()
+                    .cpu()
+                )
+
+                mean_boundary_loss = float(
+                    boundary_consistency_loss
+                    .detach()
+                    .mean()
+                    .cpu()
+                )
+
                 group_losses = {
                     target: float(
                         capacity_objective(
-                            actual_capacity[..., index:index + 1],
-                            predicted_capacity[..., index:index + 1],
-                            None if reliability is None else reliability[
-                                ..., index:index + 1
+                            actual_capacity[
+                                ...,
+                                index:
+                                index + 1
                             ],
-                        ).detach().mean().cpu()
+                            predicted_capacity[
+                                ...,
+                                index:
+                                index + 1
+                            ],
+                            (
+                                None
+                                if reliability
+                                is None
+                                else reliability[
+                                    ...,
+                                    index:
+                                    index + 1
+                                ]
+                            ),
+                        )
+                        .detach()
+                        .mean()
+                        .cpu()
                     )
-                    for index, target in enumerate(self.target_names)
+                    for index, target
+                    in enumerate(
+                        self.target_names
+                    )
                 }
-                if metric_name == _TRAIN_FICR_LOSS:
-                    epoch_train_losses.append(mean_capacity_loss)
-                    epoch_objective_train_losses.append(mean_loss)
-                    epoch_activity_train_losses.append(mean_activity_loss)
+
+                if (
+                    metric_name
+                    == _TRAIN_FICR_LOSS
+                ):
+                    epoch_train_losses.append(
+                        mean_capacity_loss
+                    )
+
+                    epoch_objective_train_losses.append(
+                        mean_loss
+                    )
+
+                    epoch_activity_train_losses.append(
+                        mean_activity_loss
+                    )
+
                     epoch_boundary_consistency_losses.append(
                         mean_boundary_loss
                     )
-                    for target, loss in group_losses.items():
-                        epoch_group_train_losses[target].append(loss)
-                    for block_id, block_loss in temporal_losses.items():
-                        scalar_loss = float(block_loss.detach().mean().cpu())
-                        epoch_temporal_losses[block_id].append(scalar_loss)
-                    return value
-                score_value = _competition_score_loss(
-                    predicted_capacity, actual_capacity
-                )
-                validation_nmae, validation_ficr = _competition_components(
-                    predicted_capacity, actual_capacity
-                )
-                history: dict[str, Any] = {
-                    'step': len(self.training_history) + 1,
-                    'train_loss': (
-                        float(np.mean(epoch_train_losses))
-                        if epoch_train_losses else None
-                    ),
-                    'validation_loss': mean_loss,
-                    'validation_score': -float(
-                        score_value.detach().mean().cpu()
-                    ),
-                    'validation_nmae': float(
-                        validation_nmae.detach().mean().cpu()
-                    ),
-                    'validation_ficr': float(
-                        validation_ficr.detach().mean().cpu()
-                    ),
-                    'training_objective_loss': (
-                        float(np.mean(epoch_objective_train_losses))
-                        if epoch_objective_train_losses else None
-                    ),
-                    'activity_train_loss': (
-                        float(np.mean(epoch_activity_train_losses))
-                        if epoch_activity_train_losses else None
-                    ),
-                    'activity_validation_loss': mean_activity_loss,
-                    'boundary_consistency_train_loss': (
-                        float(np.mean(epoch_boundary_consistency_losses))
-                        if epoch_boundary_consistency_losses else None
-                    ),
-                    'boundary_consistency_validation_loss': None,
-                }
-                for index, target in enumerate(self.target_names):
-                    train_losses = epoch_group_train_losses[target]
-                    history[f'{target}__train_loss'] = (
-                        float(np.mean(train_losses)) if train_losses else None
-                    )
-                    history[f'{target}__validation_loss'] = group_losses[target]
-                    group_score = _competition_score_loss(
-                        predicted_capacity[..., index:index + 1],
-                        actual_capacity[..., index:index + 1],
-                    )
-                    group_nmae, group_ficr = _competition_components(
-                        predicted_capacity[..., index:index + 1],
-                        actual_capacity[..., index:index + 1],
-                    )
-                    history[f'{target}__validation_score'] = -float(
-                        group_score.detach().mean().cpu()
-                    )
-                    history[f'{target}__validation_nmae'] = float(
-                        group_nmae.detach().mean().cpu()
-                    )
-                    history[f'{target}__validation_ficr'] = float(
-                        group_ficr.detach().mean().cpu()
-                    )
-                if self.config.temporal_group_dro:
-                    for block_id, losses in epoch_temporal_losses.items():
-                        if losses:
-                            dro_log_weights[block_id] += (
-                                self.config.temporal_group_dro_eta
-                                * float(np.mean(losses))
-                            )
-                    offset = max(dro_log_weights.values())
-                    for block_id in dro_log_weights:
-                        dro_log_weights[block_id] -= offset
-                if self.config.temporal_group_dro:
-                    dro_weights = normalized_dro_weights()
-                    for block_id, label in temporal_block_labels.items():
-                        losses = epoch_temporal_losses[block_id]
-                        history[f'temporal_{label}__train_ficr_loss'] = (
-                            float(np.mean(losses)) if losses else None
-                        )
-                        history[f'temporal_{label}__dro_weight'] = (
-                            dro_weights[block_id]
-                        )
-                self.training_history.append(history)
-                epoch_train_losses.clear()
-                epoch_objective_train_losses.clear()
-                epoch_activity_train_losses.clear()
-                epoch_boundary_consistency_losses.clear()
-                for losses in epoch_group_train_losses.values():
-                    losses.clear()
-                for losses in epoch_temporal_losses.values():
-                    losses.clear()
-                return value
-            return original_apply(y_pred, actual, metric_name)
 
-        Metrics.apply = staticmethod(score_aware_apply)
-        has_validation = X_valid is not None and y_valid is not None
-        self.early_stopping_enabled = False
-        fallback_rows = min(512, len(X))
-        fit_X_val = X_valid if has_validation else X.iloc[-fallback_rows:]
-        fit_y_val = y_valid if has_validation else y.iloc[-fallback_rows:]
-        capacity_y = np.array(y.to_numpy(dtype=np.float32), copy=True)
-        capacity_y_val = np.array(
-            fit_y_val.to_numpy(dtype=np.float32), copy=True
+                    for (
+                        target,
+                        loss,
+                    ) in group_losses.items():
+                        epoch_group_train_losses[
+                            target
+                        ].append(
+                            loss
+                        )
+
+                    for (
+                        block_id,
+                        block_loss,
+                    ) in temporal_losses.items():
+
+                        scalar_loss = float(
+                            block_loss
+                            .detach()
+                            .mean()
+                            .cpu()
+                        )
+
+                        epoch_temporal_losses[
+                            block_id
+                        ].append(
+                            scalar_loss
+                        )
+
+                    return value
+
+                score_value = (
+                    _competition_score_loss(
+                        predicted_capacity,
+                        actual_capacity,
+                    )
+                )
+
+                (
+                    validation_nmae,
+                    validation_ficr,
+                ) = (
+                    _competition_components(
+                        predicted_capacity,
+                        actual_capacity,
+                    )
+                )
+
+                history: dict[
+                    str,
+                    Any,
+                ] = {
+                    'step': (
+                        len(
+                            self.training_history
+                        )
+                        + 1
+                    ),
+
+                    'train_loss': (
+                        float(
+                            np.mean(
+                                epoch_train_losses
+                            )
+                        )
+                        if epoch_train_losses
+                        else None
+                    ),
+
+                    'validation_loss': (
+                        mean_loss
+                    ),
+
+                    'validation_score': (
+                        -float(
+                            score_value
+                            .detach()
+                            .mean()
+                            .cpu()
+                        )
+                    ),
+
+                    'validation_nmae': (
+                        float(
+                            validation_nmae
+                            .detach()
+                            .mean()
+                            .cpu()
+                        )
+                    ),
+
+                    'validation_ficr': (
+                        float(
+                            validation_ficr
+                            .detach()
+                            .mean()
+                            .cpu()
+                        )
+                    ),
+
+                    'training_objective_loss': (
+                        float(
+                            np.mean(
+                                epoch_objective_train_losses
+                            )
+                        )
+                        if (
+                            epoch_objective_train_losses
+                        )
+                        else None
+                    ),
+
+                    'activity_train_loss': (
+                        float(
+                            np.mean(
+                                epoch_activity_train_losses
+                            )
+                        )
+                        if (
+                            epoch_activity_train_losses
+                        )
+                        else None
+                    ),
+
+                    'activity_validation_loss': (
+                        mean_activity_loss
+                    ),
+
+                    'boundary_consistency_train_loss': (
+                        float(
+                            np.mean(
+                                epoch_boundary_consistency_losses
+                            )
+                        )
+                        if (
+                            epoch_boundary_consistency_losses
+                        )
+                        else None
+                    ),
+
+                    'boundary_consistency_validation_loss': (
+                        None
+                    ),
+                }
+
+                for (
+                    index,
+                    target,
+                ) in enumerate(
+                    self.target_names
+                ):
+
+                    train_losses = (
+                        epoch_group_train_losses[
+                            target
+                        ]
+                    )
+
+                    history[
+                        f'{target}__train_loss'
+                    ] = (
+                        float(
+                            np.mean(
+                                train_losses
+                            )
+                        )
+                        if train_losses
+                        else None
+                    )
+
+                    history[
+                        f'{target}__validation_loss'
+                    ] = (
+                        group_losses[
+                            target
+                        ]
+                    )
+
+                    group_score = (
+                        _competition_score_loss(
+                            predicted_capacity[
+                                ...,
+                                index:
+                                index + 1
+                            ],
+                            actual_capacity[
+                                ...,
+                                index:
+                                index + 1
+                            ],
+                        )
+                    )
+
+                    (
+                        group_nmae,
+                        group_ficr,
+                    ) = (
+                        _competition_components(
+                            predicted_capacity[
+                                ...,
+                                index:
+                                index + 1
+                            ],
+                            actual_capacity[
+                                ...,
+                                index:
+                                index + 1
+                            ],
+                        )
+                    )
+
+                    history[
+                        f'{target}__validation_score'
+                    ] = (
+                        -float(
+                            group_score
+                            .detach()
+                            .mean()
+                            .cpu()
+                        )
+                    )
+
+                    history[
+                        f'{target}__validation_nmae'
+                    ] = (
+                        float(
+                            group_nmae
+                            .detach()
+                            .mean()
+                            .cpu()
+                        )
+                    )
+
+                    history[
+                        f'{target}__validation_ficr'
+                    ] = (
+                        float(
+                            group_ficr
+                            .detach()
+                            .mean()
+                            .cpu()
+                        )
+                    )
+
+                if (
+                    self.config
+                    .temporal_group_dro
+                ):
+                    for (
+                        block_id,
+                        losses,
+                    ) in (
+                        epoch_temporal_losses
+                        .items()
+                    ):
+                        if losses:
+                            dro_log_weights[
+                                block_id
+                            ] += (
+                                self.config
+                                .temporal_group_dro_eta
+                                * float(
+                                    np.mean(
+                                        losses
+                                    )
+                                )
+                            )
+
+                    offset = max(
+                        dro_log_weights
+                        .values()
+                    )
+
+                    for block_id in (
+                        dro_log_weights
+                    ):
+                        dro_log_weights[
+                            block_id
+                        ] -= offset
+
+                if (
+                    self.config
+                    .temporal_group_dro
+                ):
+                    dro_weights = (
+                        normalized_dro_weights()
+                    )
+
+                    for (
+                        block_id,
+                        label,
+                    ) in (
+                        temporal_block_labels
+                        .items()
+                    ):
+                        losses = (
+                            epoch_temporal_losses[
+                                block_id
+                            ]
+                        )
+
+                        history[
+                            f'temporal_{label}'
+                            '__train_ficr_loss'
+                        ] = (
+                            float(
+                                np.mean(
+                                    losses
+                                )
+                            )
+                            if losses
+                            else None
+                        )
+
+                        history[
+                            f'temporal_{label}'
+                            '__dro_weight'
+                        ] = (
+                            dro_weights[
+                                block_id
+                            ]
+                        )
+
+                self.training_history.append(
+                    history
+                )
+
+                # =================================================
+                # Explicit epoch logging.
+                #
+                # PyTabKit verbosity=0 suppresses the huge feature
+                # dump. Important epoch metrics are logged here.
+                # =================================================
+
+                train_loss = history.get(
+                    'train_loss'
+                )
+
+                validation_loss = (
+                    history.get(
+                        'validation_loss'
+                    )
+                )
+
+                validation_score = (
+                    history.get(
+                        'validation_score'
+                    )
+                )
+
+                validation_nmae = (
+                    history.get(
+                        'validation_nmae'
+                    )
+                )
+
+                validation_ficr = (
+                    history.get(
+                        'validation_ficr'
+                    )
+                )
+
+                LOGGER.info(
+                    'RealMLP epoch '
+                    '%03d/%03d | '
+                    'train_loss=%s | '
+                    'val_loss=%.8f | '
+                    'score=%.6f | '
+                    'NMAE=%.6f | '
+                    'FICR=%.6f',
+                    history['step'],
+                    self.epochs,
+                    (
+                        f'{train_loss:.8f}'
+                        if train_loss
+                        is not None
+                        else 'N/A'
+                    ),
+                    float(
+                        validation_loss
+                    ),
+                    float(
+                        validation_score
+                    ),
+                    float(
+                        validation_nmae
+                    ),
+                    float(
+                        validation_ficr
+                    ),
+                )
+
+                epoch_train_losses.clear()
+
+                epoch_objective_train_losses.clear()
+
+                epoch_activity_train_losses.clear()
+
+                epoch_boundary_consistency_losses.clear()
+
+                for losses in (
+                    epoch_group_train_losses
+                    .values()
+                ):
+                    losses.clear()
+
+                for losses in (
+                    epoch_temporal_losses
+                    .values()
+                ):
+                    losses.clear()
+
+                return value
+
+            return original_apply(
+                y_pred,
+                actual,
+                metric_name,
+            )
+
+        # =========================================================
+        # Patch PyTabKit metric function
+        # =========================================================
+
+        Metrics.apply = staticmethod(
+            score_aware_apply
         )
-        observed_y = np.isfinite(capacity_y)
-        observed_y_val = np.isfinite(capacity_y_val)
+
+        has_validation = (
+            X_valid is not None
+            and y_valid is not None
+        )
+
+        self.early_stopping_enabled = (
+            False
+        )
+
+        fallback_rows = min(
+            512,
+            len(X),
+        )
+
+        fit_X_val = (
+            X_valid
+            if has_validation
+            else X.iloc[
+                -fallback_rows:
+            ]
+        )
+
+        fit_y_val = (
+            y_valid
+            if has_validation
+            else y.iloc[
+                -fallback_rows:
+            ]
+        )
+
+        capacity_y = np.array(
+            y.to_numpy(
+                dtype=np.float32
+            ),
+            copy=True,
+        )
+
+        capacity_y_val = np.array(
+            fit_y_val.to_numpy(
+                dtype=np.float32
+            ),
+            copy=True,
+        )
+
+        observed_y = np.isfinite(
+            capacity_y
+        )
+
+        observed_y_val = (
+            np.isfinite(
+                capacity_y_val
+            )
+        )
+
         activity_y = np.where(
-            observed_y, capacity_y >= 0.10, _MISSING_TARGET
-        ).astype(np.float32)
+            observed_y,
+            capacity_y >= 0.10,
+            _MISSING_TARGET,
+        ).astype(
+            np.float32
+        )
+
         activity_y_val = np.where(
-            observed_y_val, capacity_y_val >= 0.10, _MISSING_TARGET
-        ).astype(np.float32)
-        if self.config.group3_reliability_weighting:
-            reliability_y, self.group3_reliability_metadata = (
+            observed_y_val,
+            capacity_y_val >= 0.10,
+            _MISSING_TARGET,
+        ).astype(
+            np.float32
+        )
+
+        if (
+            self.config
+            .group3_reliability_weighting
+        ):
+            (
+                reliability_y,
+                self.group3_reliability_metadata,
+            ) = (
                 group3_cross_fitted_reliability(
                     X,
                     y,
-                    min_weight=self.config.group3_reliability_min_weight,
-                    seed=self.config.seed,
+                    min_weight=(
+                        self.config
+                        .group3_reliability_min_weight
+                    ),
+                    seed=(
+                        self.config.seed
+                    ),
                 )
             )
+
             LOGGER.info(
-                'Group 3 cross-fitted reliability: %s',
+                'Group 3 cross-fitted '
+                'reliability: %s',
                 self.group3_reliability_metadata,
             )
+
         else:
-            reliability_y = np.ones_like(capacity_y, dtype=np.float32)
+            reliability_y = np.ones_like(
+                capacity_y,
+                dtype=np.float32,
+            )
+
             self.group3_reliability_metadata = {
-                'enabled': False, 'reason': 'disabled by configuration'
+                'enabled': False,
+                'reason': (
+                    'disabled by configuration'
+                ),
             }
-        reliability_y_val = np.ones_like(capacity_y_val, dtype=np.float32)
-        capacity_y[~observed_y] = _MISSING_TARGET
-        capacity_y_val[~observed_y_val] = _MISSING_TARGET
-        validation_block_ids, _ = _quarter_block_ids(fit_X_val.index)
+
+        reliability_y_val = (
+            np.ones_like(
+                capacity_y_val,
+                dtype=np.float32,
+            )
+        )
+
+        capacity_y[
+            ~observed_y
+        ] = _MISSING_TARGET
+
+        capacity_y_val[
+            ~observed_y_val
+        ] = _MISSING_TARGET
+
+        (
+            validation_block_ids,
+            _,
+        ) = _quarter_block_ids(
+            fit_X_val.index
+        )
+
         packed_activity_y = (
-            _pack_activity_block_metadata(activity_y, block_ids)
-            if self.config.temporal_group_dro else activity_y
+            _pack_activity_block_metadata(
+                activity_y,
+                block_ids,
+            )
+            if (
+                self.config
+                .temporal_group_dro
+            )
+            else activity_y
         )
+
         packed_activity_y_val = (
-            _pack_activity_block_metadata(activity_y_val, validation_block_ids)
-            if self.config.temporal_group_dro else activity_y_val
-        )
-        if self.config.group3_reliability_weighting:
-            packed_activity_y = _pack_reliability_metadata(
-                packed_activity_y, reliability_y
+            _pack_activity_block_metadata(
+                activity_y_val,
+                validation_block_ids,
             )
-            packed_activity_y_val = _pack_reliability_metadata(
-                packed_activity_y_val, reliability_y_val
+            if (
+                self.config
+                .temporal_group_dro
             )
-        fit_y = np.concatenate([capacity_y, packed_activity_y], axis=1)
-        fit_y_val_array = np.concatenate(
-            [capacity_y_val, packed_activity_y_val], axis=1
+            else activity_y_val
         )
-        self.model = RealMLP_TD_Regressor(
-            device=self.device, random_state=self.config.seed,
-            n_threads=self.n_threads, n_epochs=self.epochs,
-            batch_size=self.config.batch_size, n_cv=1, n_refit=0,
-            n_ens=8, normalize_output=False,
-            lr=self.config.learning_rate, lr_sched='coslog4',
-            **_REALMLP_TD_REG_PARAMS,
-            train_metric_name=_TRAIN_FICR_LOSS,
-            val_metric_name=_VAL_FICR_LOSS,
-            use_early_stopping=False,
-            stop_epoch=None if has_validation else self.epochs,
-            verbosity=0,
+
+        if (
+            self.config
+            .group3_reliability_weighting
+        ):
+            packed_activity_y = (
+                _pack_reliability_metadata(
+                    packed_activity_y,
+                    reliability_y,
+                )
+            )
+
+            packed_activity_y_val = (
+                _pack_reliability_metadata(
+                    packed_activity_y_val,
+                    reliability_y_val,
+                )
+            )
+
+        fit_y = np.concatenate(
+            [
+                capacity_y,
+                packed_activity_y,
+            ],
+            axis=1,
+        )
+
+        fit_y_val_array = (
+            np.concatenate(
+                [
+                    capacity_y_val,
+                    packed_activity_y_val,
+                ],
+                axis=1,
+            )
+        )
+
+        # =========================================================
+        # RealMLP
+        # =========================================================
+
+        self.model = (
+            RealMLP_TD_Regressor(
+                device=(
+                    self.device
+                ),
+                random_state=(
+                    self.config.seed
+                ),
+                n_threads=(
+                    self.n_threads
+                ),
+                n_epochs=(
+                    self.epochs
+                ),
+                batch_size=(
+                    self.config.batch_size
+                ),
+                n_cv=1,
+                n_refit=0,
+
+                # 8-member RealMLP ensemble.
+                n_ens=8,
+
+                normalize_output=False,
+
+                lr=(
+                    self.config
+                    .learning_rate
+                ),
+
+                lr_sched='coslog4',
+
+                **_REALMLP_TD_REG_PARAMS,
+
+                train_metric_name=(
+                    _TRAIN_FICR_LOSS
+                ),
+
+                val_metric_name=(
+                    _VAL_FICR_LOSS
+                ),
+
+                use_early_stopping=False,
+
+                stop_epoch=(
+                    None
+                    if has_validation
+                    else self.epochs
+                ),
+
+                # Suppress PyTabKit's huge feature/schema dump.
+                # Epoch metrics are logged manually above.
+                verbosity=0,
+            )
         )
 
         try:
             self.model.fit(
-                X, fit_y, X_val=fit_X_val, y_val=fit_y_val_array
+                X,
+                fit_y,
+                X_val=fit_X_val,
+                y_val=(
+                    fit_y_val_array
+                ),
             )
+
         finally:
-            Metrics.apply = staticmethod(original_apply)
-        if self.config.temporal_group_dro:
-            final_dro_weights = normalized_dro_weights()
+            # Restore global PyTabKit metric implementation
+            # even if training fails.
+            Metrics.apply = (
+                staticmethod(
+                    original_apply
+                )
+            )
+
+        # =========================================================
+        # Final metadata
+        # =========================================================
+
+        if (
+            self.config
+            .temporal_group_dro
+        ):
+            final_dro_weights = (
+                normalized_dro_weights()
+            )
+
             self.temporal_block_weights = {
-                temporal_block_labels[key]: final_dro_weights[key]
-                for key in temporal_block_labels
+                temporal_block_labels[
+                    key
+                ]: (
+                    final_dro_weights[
+                        key
+                    ]
+                )
+                for key
+                in temporal_block_labels
             }
+
         else:
             self.temporal_block_weights = {}
-        self.best_iteration = self._read_best_iteration()
-        self.elapsed_seconds = time.perf_counter() - started
-        LOGGER.info('RealMLP best epoch=%d', self.best_iteration)
+
+        self.best_iteration = (
+            self._read_best_iteration()
+        )
+
+        self.elapsed_seconds = (
+            time.perf_counter()
+            - started
+        )
+
+        LOGGER.info(
+            'RealMLP best epoch=%d',
+            self.best_iteration,
+        )
+
         return self
 
-    def _read_best_iteration(self) -> int:
+    def _read_best_iteration(
+        self,
+    ) -> int:
+
         candidates = [
-            getattr(self.model, 'fit_params_', None),
-            getattr(getattr(self.model, 'alg_interface_', None), 'fit_params', None),
+            getattr(
+                self.model,
+                'fit_params_',
+                None,
+            ),
+            getattr(
+                getattr(
+                    self.model,
+                    'alg_interface_',
+                    None,
+                ),
+                'fit_params',
+                None,
+            ),
         ]
+
         for candidate in candidates:
-            if isinstance(candidate, list) and candidate:
-                candidate = candidate[0]
-            if isinstance(candidate, dict):
-                value = candidate.get('stop_epoch', candidate.get('best_epoch'))
-                if isinstance(value, dict):
-                    value = value.get(_VAL_FICR_LOSS)
+
+            if (
+                isinstance(
+                    candidate,
+                    list,
+                )
+                and candidate
+            ):
+                candidate = (
+                    candidate[0]
+                )
+
+            if isinstance(
+                candidate,
+                dict,
+            ):
+                value = (
+                    candidate.get(
+                        'stop_epoch',
+                        candidate.get(
+                            'best_epoch'
+                        ),
+                    )
+                )
+
+                if isinstance(
+                    value,
+                    dict,
+                ):
+                    value = (
+                        value.get(
+                            _VAL_FICR_LOSS
+                        )
+                    )
+
                 if value is not None:
-                    return max(1, int(value))
+                    return max(
+                        1,
+                        int(value),
+                    )
+
         return self.epochs
 
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        if self.model is None:
-            raise RuntimeError('RealMLP must be fitted before predict().')
-        prediction = np.asarray(self.model.predict(X), dtype=float)
-        prediction = prediction.reshape(len(X), 2 * len(self.target_names))
-        return prediction[:, :len(self.target_names)]
+    def predict(
+        self,
+        X: pd.DataFrame,
+    ) -> np.ndarray:
 
-    def metadata(self) -> dict[str, Any]:
+        if self.model is None:
+            raise RuntimeError(
+                'RealMLP must be fitted '
+                'before predict().'
+            )
+
+        prediction = np.asarray(
+            self.model.predict(
+                X
+            ),
+            dtype=float,
+        )
+
+        prediction = (
+            prediction.reshape(
+                len(X),
+                2 * len(
+                    self.target_names
+                ),
+            )
+        )
+
+        return prediction[
+            :,
+            :len(
+                self.target_names
+            ),
+        ]
+
+    def metadata(
+        self,
+    ) -> dict[str, Any]:
+
         return {
-            'model': 'RealMLP-TD', 'training': 'supervised-gradient',
-            'architecture': 'shared-trunk-capacity-and-activity-heads',
-            'targets': self.target_names,
-            'max_epochs': self.epochs, 'best_iteration': self.best_iteration,
-            'validation_metric': 'ficr-aware-loss', 'n_ens': 8,
-            'loss_name': f'{self.config.ficr_loss}-ficr-aware',
-            'selection_metric': f'{self.config.ficr_loss}-ficr-aware-loss',
-            'ficr_weight': self.config.ficr_weight,
-            'ficr_temperature': self.config.ficr_temperature,
-            'ficr_loss': self.config.ficr_loss,
-            'ficr_relu_margin': self.config.ficr_relu_margin,
+            'model': (
+                'RealMLP-TD'
+            ),
+
+            'training': (
+                'supervised-gradient'
+            ),
+
+            'architecture': (
+                'shared-trunk-capacity-'
+                'and-activity-heads'
+            ),
+
+            'targets': (
+                self.target_names
+            ),
+
+            'max_epochs': (
+                self.epochs
+            ),
+
+            'best_iteration': (
+                self.best_iteration
+            ),
+
+            'validation_metric': (
+                'ficr-aware-loss'
+            ),
+
+            'n_ens': 8,
+
+            'loss_name': (
+                f'{self.config.ficr_loss}'
+                '-ficr-aware'
+            ),
+
+            'selection_metric': (
+                f'{self.config.ficr_loss}'
+                '-ficr-aware-loss'
+            ),
+
+            'ficr_weight': (
+                self.config
+                .ficr_weight
+            ),
+
+            'ficr_temperature': (
+                self.config
+                .ficr_temperature
+            ),
+
+            'ficr_loss': (
+                self.config
+                .ficr_loss
+            ),
+
+            'ficr_relu_margin': (
+                self.config
+                .ficr_relu_margin
+            ),
+
             'ficr_relu_thresholds': [
-                0.06 - self.config.ficr_relu_margin,
-                0.08 - self.config.ficr_relu_margin,
+                (
+                    0.06
+                    - self.config
+                    .ficr_relu_margin
+                ),
+                (
+                    0.08
+                    - self.config
+                    .ficr_relu_margin
+                ),
             ],
+
             'ficr_boundary_consistency_weight': (
-                self.config.ficr_boundary_consistency_weight
+                self.config
+                .ficr_boundary_consistency_weight
             ),
-            'ficr_boundary_consistency': 'internal-ensemble-soft-reward-variance',
-            'temporal_group_dro': self.config.temporal_group_dro,
-            'temporal_group_dro_eta': self.config.temporal_group_dro_eta,
-            'temporal_blocks': 'calendar-quarter',
-            'temporal_block_weights': self.temporal_block_weights,
-            'temporal_metadata_transport': 'packed-first-activity-target',
+
+            'ficr_boundary_consistency': (
+                'internal-ensemble-'
+                'soft-reward-variance'
+            ),
+
+            'temporal_group_dro': (
+                self.config
+                .temporal_group_dro
+            ),
+
+            'temporal_group_dro_eta': (
+                self.config
+                .temporal_group_dro_eta
+            ),
+
+            'temporal_blocks': (
+                'calendar-quarter'
+            ),
+
+            'temporal_block_weights': (
+                self.temporal_block_weights
+            ),
+
+            'temporal_metadata_transport': (
+                'packed-first-activity-target'
+            ),
+
             'group3_reliability_weighting': (
-                self.config.group3_reliability_weighting
+                self.config
+                .group3_reliability_weighting
             ),
+
             'group3_reliability_min_weight': (
-                self.config.group3_reliability_min_weight
+                self.config
+                .group3_reliability_min_weight
             ),
-            'group3_reliability': self.group3_reliability_metadata,
-            'group3_reliability_scope': 'capacity-loss-only',
-            'group3_reliability_validation_weights': 'all-one',
-            'activity_loss_weight': self.config.activity_loss_weight,
-            'activity_threshold': 0.10,
-            'learning_rate': self.config.learning_rate,
-            'lr_schedule': 'coslog4',
-            'dropout': 0.15,
-            'dropout_schedule': 'flat_cos',
-            'weight_decay': 2e-2,
-            'weight_decay_schedule': 'flat_cos',
-            'optimizer': 'adam',
-            'squared_momentum': 0.95,
-            'weight_parameterization': 'ntk',
-            'target_normalization': False,
-            'target_masking': 'missing=-1; capacity>=0.10; activity=all-observed',
-            'early_stopping': self.early_stopping_enabled,
-            'training_history': self.training_history,
-            'device': self.device, 'n_threads': self.n_threads,
-            'elapsed_seconds': self.elapsed_seconds,
+
+            'group3_reliability': (
+                self.group3_reliability_metadata
+            ),
+
+            'group3_reliability_scope': (
+                'capacity-loss-only'
+            ),
+
+            'group3_reliability_validation_weights': (
+                'all-one'
+            ),
+
+            'activity_loss_weight': (
+                self.config
+                .activity_loss_weight
+            ),
+
+            'activity_threshold': (
+                0.10
+            ),
+
+            'learning_rate': (
+                self.config
+                .learning_rate
+            ),
+
+            'lr_schedule': (
+                'coslog4'
+            ),
+
+            'dropout': (
+                0.15
+            ),
+
+            'dropout_schedule': (
+                'flat_cos'
+            ),
+
+            'weight_decay': (
+                2e-2
+            ),
+
+            'weight_decay_schedule': (
+                'flat_cos'
+            ),
+
+            'optimizer': (
+                'adam'
+            ),
+
+            'squared_momentum': (
+                0.95
+            ),
+
+            'weight_parameterization': (
+                'ntk'
+            ),
+
+            'target_normalization': (
+                False
+            ),
+
+            'target_masking': (
+                'missing=-1; '
+                'capacity>=0.10; '
+                'activity=all-observed'
+            ),
+
+            'early_stopping': (
+                self.early_stopping_enabled
+            ),
+
+            'training_history': (
+                self.training_history
+            ),
+
+            'device': (
+                self.device
+            ),
+
+            'n_threads': (
+                self.n_threads
+            ),
+
+            'elapsed_seconds': (
+                self.elapsed_seconds
+            ),
         }
