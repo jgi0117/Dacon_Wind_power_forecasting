@@ -1,4 +1,4 @@
-"""대회 공식 평가 산식과 발전량 정규화 유틸리티."""
+"""Competition metrics and FICR-aware training losses."""
 
 from __future__ import annotations
 
@@ -14,6 +14,12 @@ CAPACITY_KWH = {
     "kpx_group_2": 21_600.0,
     "kpx_group_3": 21_000.0,
 }
+
+# Only the FICR part is regularized. MAE remains a plain equal-group mean.
+# The penalty is the gap between the worst-group FICR loss and the mean-group
+# FICR loss. This prevents one group from being sacrificed while avoiding an
+# extra MAE penalty.
+WORST_GROUP_FICR_REG_WEIGHT = 0.20
 
 
 def _validate_frames(answer: pd.DataFrame, prediction: pd.DataFrame) -> None:
@@ -36,13 +42,10 @@ def align_by_time(
     answer_time_col: str = "kst_dtm",
     prediction_time_col: str = "forecast_kst_dtm",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Strictly align answer and prediction frames by timestamp."""
     answer = answer.copy()
     prediction = prediction.copy()
     answer[answer_time_col] = pd.to_datetime(answer[answer_time_col])
-    prediction[prediction_time_col] = pd.to_datetime(
-        prediction[prediction_time_col]
-    )
+    prediction[prediction_time_col] = pd.to_datetime(prediction[prediction_time_col])
     if answer[answer_time_col].duplicated().any():
         raise ValueError("Answer timestamps contain duplicates.")
     if prediction[prediction_time_col].duplicated().any():
@@ -68,12 +71,11 @@ def restore_generation(prediction: np.ndarray, target: str) -> np.ndarray:
 
 
 def target_score(actual: np.ndarray, prediction: np.ndarray) -> float:
-    '''Competition score for one capacity-factor target (higher is better).'''
     actual = np.asarray(actual, dtype=float).reshape(-1)
     prediction = np.asarray(prediction, dtype=float).reshape(-1)
     valid = np.isfinite(actual) & np.isfinite(prediction) & (actual >= 0.10)
     if not valid.any():
-        raise ValueError('No rows are eligible for the target score.')
+        raise ValueError("No rows are eligible for the target score.")
     actual_valid = actual[valid]
     error = np.abs(np.clip(prediction[valid], 0.0, 1.0) - actual_valid)
     nmae = float(error.mean())
@@ -87,6 +89,27 @@ def target_score(actual: np.ndarray, prediction: np.ndarray) -> float:
     return 0.5 * (1.0 - nmae) + 0.5 * ficr
 
 
+def _masked_mean(values: Any, valid_groups: Any) -> Any:
+    import torch
+    return (
+        torch.where(valid_groups, values, torch.zeros_like(values)).sum(dim=-1)
+        / valid_groups.sum(dim=-1).clamp_min(1)
+    )
+
+
+def _worst_group_gap(group_ficr_loss: Any, valid_groups: Any) -> Any:
+    """Differentiable FICR-only imbalance penalty: worst - mean."""
+    import torch
+
+    mean_loss = _masked_mean(group_ficr_loss, valid_groups)
+    neg_inf = torch.full_like(group_ficr_loss, -torch.inf)
+    worst_loss = torch.where(valid_groups, group_ficr_loss, neg_inf).max(dim=-1).values
+    # No penalty when fewer than two groups are valid.
+    enough_groups = valid_groups.sum(dim=-1) >= 2
+    gap = (worst_loss - mean_loss).clamp_min(0.0)
+    return torch.where(enough_groups, gap, torch.zeros_like(gap))
+
+
 def ficr_aware_loss_torch(
     actual: Any,
     prediction: Any,
@@ -94,8 +117,19 @@ def ficr_aware_loss_torch(
     ficr_weight: float = 0.75,
     temperature: float = 0.01,
     sample_weight: Any | None = None,
+    worst_group_ficr_reg_weight: float | None = None,
 ) -> Any:
-    '''Masked soft-FICR loss with equal weighting across target groups.'''
+    """Masked soft-FICR loss with FICR-only worst-group regularization.
+
+    Base objective:
+        (1-ficr_weight) * mean_group_MAE
+        + ficr_weight * mean_group_FICR_loss
+
+    Regularizer:
+        lambda * (worst_group_FICR_loss - mean_group_FICR_loss)
+
+    The MAE term is deliberately not regularized.
+    """
     import torch
 
     if actual.ndim < prediction.ndim:
@@ -124,9 +158,9 @@ def ficr_aware_loss_torch(
     sample_dim = -2
     weight_sum = effective_weight.sum(dim=sample_dim)
     safe_weight_sum = weight_sum.clamp_min(1e-12)
-    mae = (
-        (smooth_error * effective_weight).sum(dim=sample_dim)
-        / safe_weight_sum
+
+    group_mae = (
+        (smooth_error * effective_weight).sum(dim=sample_dim) / safe_weight_sum
     )
     sigmoid_6 = torch.sigmoid((0.06 - smooth_error) / temperature)
     sigmoid_8 = torch.sigmoid((0.08 - smooth_error) / temperature)
@@ -135,22 +169,30 @@ def ficr_aware_loss_torch(
     soft_ficr = (soft_reward * actual_weight).sum(dim=sample_dim) / (
         actual_weight.sum(dim=sample_dim).clamp_min(1e-12)
     )
-    group_loss = (
-        (1.0 - ficr_weight) * mae + ficr_weight * (1.0 - soft_ficr)
-    )
+    group_ficr_loss = 1.0 - soft_ficr
     valid_groups = weight_sum > 0
-    valid_group_count = valid_groups.sum(dim=-1).clamp_min(1)
-    return (
-        torch.where(valid_groups, group_loss, torch.zeros_like(group_loss))
-        .sum(dim=-1)
-        / valid_group_count
+
+    mean_mae = _masked_mean(group_mae, valid_groups)
+    mean_ficr_loss = _masked_mean(group_ficr_loss, valid_groups)
+    base_loss = (1.0 - ficr_weight) * mean_mae + ficr_weight * mean_ficr_loss
+
+    reg_weight = (
+        WORST_GROUP_FICR_REG_WEIGHT
+        if worst_group_ficr_reg_weight is None
+        else float(worst_group_ficr_reg_weight)
     )
+    reg = _worst_group_gap(group_ficr_loss, valid_groups)
+    return base_loss + reg_weight * reg
 
 
 def relu_ficr_aware_loss_torch(
-    actual, prediction, ficr_weight=0.75, margin=0.005,
-):
-    '''Masked conservative ReLU-FICR loss with global smooth MAE.'''
+    actual: Any,
+    prediction: Any,
+    ficr_weight: float = 0.75,
+    margin: float = 0.005,
+    worst_group_ficr_reg_weight: float | None = None,
+) -> Any:
+    """Conservative ReLU-FICR loss with FICR-only worst-group regularization."""
     import torch
     import torch.nn.functional as functional
 
@@ -171,33 +213,39 @@ def relu_ficr_aware_loss_torch(
     valid_float = valid.to(smooth_error.dtype)
     count = valid_float.sum(dim=-2)
     safe_count = count.clamp_min(1.0)
-    mae = (smooth_error * valid_float).sum(dim=-2) / safe_count
-    mean_actual = (
-        (safe_actual * valid_float).sum(dim=-2) / safe_count
-    ).clamp_min(1e-12)
+
+    group_mae = (smooth_error * valid_float).sum(dim=-2) / safe_count
+    mean_actual = ((safe_actual * valid_float).sum(dim=-2) / safe_count).clamp_min(1e-12)
     normalized_weight = safe_actual / mean_actual.unsqueeze(-2)
     hinge_6 = functional.relu(smooth_error - (0.06 - margin))
     hinge_8 = functional.relu(smooth_error - (0.08 - margin))
     relu_penalty = 0.25 * hinge_6 + 0.75 * hinge_8
-    weighted_penalty = (
+    group_ficr_loss = (
         relu_penalty * normalized_weight * valid_float
     ).sum(dim=-2) / safe_count
-    group_loss = (
-        (1.0 - ficr_weight) * mae + ficr_weight * weighted_penalty
-    )
     valid_groups = count > 0
-    return (
-        torch.where(valid_groups, group_loss, torch.zeros_like(group_loss))
-        .sum(dim=-1)
-        / valid_groups.sum(dim=-1).clamp_min(1)
+
+    mean_mae = _masked_mean(group_mae, valid_groups)
+    mean_ficr_loss = _masked_mean(group_ficr_loss, valid_groups)
+    base_loss = (1.0 - ficr_weight) * mean_mae + ficr_weight * mean_ficr_loss
+    reg_weight = (
+        WORST_GROUP_FICR_REG_WEIGHT
+        if worst_group_ficr_reg_weight is None
+        else float(worst_group_ficr_reg_weight)
     )
+    reg = _worst_group_gap(group_ficr_loss, valid_groups)
+    return base_loss + reg_weight * reg
 
 
 def temporal_group_dro_ficr_loss_torch(
-    actual, prediction, block_ids, block_weights,
-    ficr_weight=0.75, temperature=0.01,
-):
-    '''Combine global MAE with GroupDRO-weighted temporal soft-FICR.'''
+    actual: Any,
+    prediction: Any,
+    block_ids: Any,
+    block_weights: dict[int, float],
+    ficr_weight: float = 0.75,
+    temperature: float = 0.01,
+) -> tuple[Any, dict[int, Any]]:
+    """Combine global MAE with GroupDRO-weighted temporal soft-FICR."""
     import torch
 
     ids = block_ids
@@ -205,20 +253,25 @@ def temporal_group_dro_ficr_loss_torch(
         ids = ids.squeeze(-1) if ids.shape[-1] == 1 else ids[0]
     ids = ids.to(dtype=torch.long)
     global_mae = ficr_aware_loss_torch(
-        actual, prediction, ficr_weight=0.0, temperature=temperature
+        actual,
+        prediction,
+        ficr_weight=0.0,
+        temperature=temperature,
+        worst_group_ficr_reg_weight=0.0,
     )
-    block_losses = {}
+    block_losses: dict[int, Any] = {}
     for block_id in sorted(block_weights):
         selected = ids == block_id
         if bool(selected.any().item()):
             block_losses[block_id] = ficr_aware_loss_torch(
-                actual[..., selected, :], prediction[..., selected, :],
-                ficr_weight=1.0, temperature=temperature,
+                actual[..., selected, :],
+                prediction[..., selected, :],
+                ficr_weight=1.0,
+                temperature=temperature,
             )
     if not block_losses:
         fallback = ficr_aware_loss_torch(
-            actual, prediction, ficr_weight=ficr_weight,
-            temperature=temperature,
+            actual, prediction, ficr_weight=ficr_weight, temperature=temperature
         )
         return fallback, {}
     weight_sum = sum(block_weights[key] for key in block_losses)
@@ -231,14 +284,19 @@ def temporal_group_dro_ficr_loss_torch(
 
 
 def ficr_boundary_consistency_loss_torch(
-    actual, prediction, temperature=0.01,
-):
-    '''Penalize ensemble disagreement in the soft 6%/8% FICR decisions.'''
+    actual: Any,
+    prediction: Any,
+    temperature: float = 0.01,
+) -> Any:
     import torch
 
     if prediction.ndim < 3 or prediction.shape[0] < 2:
         return ficr_aware_loss_torch(
-            actual, prediction, ficr_weight=0.0, temperature=temperature
+            actual,
+            prediction,
+            ficr_weight=0.0,
+            temperature=temperature,
+            worst_group_ficr_reg_weight=0.0,
         ) * 0.0
     if actual.ndim < prediction.ndim:
         actual = actual.unsqueeze(0).expand_as(prediction)
@@ -252,7 +310,6 @@ def ficr_boundary_consistency_loss_torch(
     soft_8 = torch.sigmoid((0.08 - error) / temperature)
     soft_reward = (3.0 * soft_8 + soft_6) / 4.0
     reward_variance = soft_reward.var(dim=0, unbiased=False)
-
     mean_error = error.mean(dim=0)
     mean_6 = torch.sigmoid((0.06 - mean_error) / temperature)
     mean_8 = torch.sigmoid((0.08 - mean_error) / temperature)
@@ -268,14 +325,11 @@ def ficr_boundary_consistency_loss_torch(
         reward_variance * boundary_weight
     ).sum(dim=-2) / denominator.clamp_min(1e-12)
     valid_groups = denominator > 0.0
-    scalar = torch.where(
-        valid_groups, group_loss, torch.zeros_like(group_loss)
-    ).sum(dim=-1) / valid_groups.sum(dim=-1).clamp_min(1)
+    scalar = _masked_mean(group_loss, valid_groups)
     return scalar.expand(prediction.shape[0])
 
 
 def activity_loss_torch(actual: Any, logits: Any) -> Any:
-    '''Masked binary loss for whether an observed capacity factor is >= 10%.'''
     import torch
     import torch.nn.functional as functional
 
@@ -292,7 +346,7 @@ def activity_loss_torch(actual: Any, logits: Any) -> Any:
     labels = (actual >= 0.10).to(logits.dtype)
     safe_logits = torch.where(observed, logits, torch.zeros_like(logits))
     element_loss = functional.binary_cross_entropy_with_logits(
-        safe_logits, labels, reduction='none'
+        safe_logits, labels, reduction="none"
     )
     observed_float = observed.to(element_loss.dtype)
     count = observed_float.sum(dim=-2)
@@ -300,11 +354,7 @@ def activity_loss_torch(actual: Any, logits: Any) -> Any:
         (element_loss * observed_float).sum(dim=-2) / count.clamp_min(1.0)
     )
     valid_groups = count > 0
-    return (
-        torch.where(valid_groups, group_loss, torch.zeros_like(group_loss))
-        .sum(dim=-1)
-        / valid_groups.sum(dim=-1).clamp_min(1)
-    )
+    return _masked_mean(group_loss, valid_groups)
 
 
 def metric_report(answer: pd.DataFrame, prediction: pd.DataFrame) -> dict[str, Any]:
@@ -351,16 +401,12 @@ def metric_report(answer: pd.DataFrame, prediction: pd.DataFrame) -> dict[str, A
     }
 
 
-def metric(
-    answer: pd.DataFrame, prediction: pd.DataFrame
-) -> tuple[float, float, float]:
-    """Return ``(score, one_minus_nmae, ficr)``."""
+def metric(answer: pd.DataFrame, prediction: pd.DataFrame) -> tuple[float, float, float]:
     report = metric_report(answer, prediction)
     return report["score"], report["one_minus_nmae"], report["ficr"]
 
 
 def report_frame(report: dict[str, Any]) -> pd.DataFrame:
-    """Convert the per-target section of a metric report to a DataFrame."""
     frame = pd.DataFrame.from_dict(report["groups"], orient="index")
     frame.index.name = "group"
     return frame
@@ -372,7 +418,9 @@ def evaluate_complete_rows(
     usable = answer[TARGET_COLS].notna().all(axis=1)
     if not usable.any():
         raise ValueError("세 그룹 정답이 모두 있는 평가 행이 없습니다.")
-    return metric_report(answer.loc[usable, TARGET_COLS], prediction.loc[usable, TARGET_COLS])
+    return metric_report(
+        answer.loc[usable, TARGET_COLS], prediction.loc[usable, TARGET_COLS]
+    )
 
 
 def flatten_report(model_name: str, report: dict[str, Any]) -> dict[str, Any]:

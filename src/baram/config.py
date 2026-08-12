@@ -65,14 +65,6 @@ class PipelineConfig:
     ficr_boundary_consistency_weight: float = 0.0
     activity_loss_weight: float = 0.15
 
-    # Version 6 experimental G3 residual stage.
-    group3_residual: bool = False
-    group3_residual_validation_start: str = "2024-07-01 01:00:00"
-    group3_residual_epochs: int = 80
-    group3_residual_ensemble: int = 8
-    group3_residual_learning_rate: float = 0.02
-    group3_residual_batch_size: int = 256
-    group3_residual_max_abs_correction: float = 0.20
 
     device: str | None = None
     evaluation_only: bool = False
@@ -212,45 +204,6 @@ def parse_args() -> PipelineConfig:
     )
     parser.add_argument("--activity-loss-weight", type=float, default=0.15)
 
-    # G3 residual CLI.
-    parser.add_argument(
-        "--enable-group3-residual",
-        dest="group3_residual",
-        action="store_true",
-        default=False,
-        help=(
-            "Train a second-stage RealMLP on kpx_group_3 residuals from "
-            "base validation predictions and apply it only to group 3."
-        ),
-    )
-    parser.add_argument(
-        "--group3-residual-validation-start",
-        default="2024-07-01 01:00:00",
-        help=(
-            "Residual model train/validation boundary. Residual train uses "
-            "[validation_start, this timestamp); residual validation uses "
-            "[this timestamp, comparison_start)."
-        ),
-    )
-    parser.add_argument("--group3-residual-epochs", type=int, default=80)
-    parser.add_argument("--group3-residual-ensemble", type=int, default=8)
-    parser.add_argument(
-        "--group3-residual-learning-rate",
-        type=float,
-        default=0.02,
-    )
-    parser.add_argument(
-        "--group3-residual-batch-size",
-        type=int,
-        default=256,
-    )
-    parser.add_argument(
-        "--group3-residual-max-abs-correction",
-        type=float,
-        default=0.20,
-        help="Maximum absolute correction in capacity-factor units.",
-    )
-
     parser.add_argument("--device", default=None, help="cpu, cuda, or omit for auto")
     parser.add_argument("--evaluation-only", action="store_true")
 
@@ -265,9 +218,6 @@ def parse_args() -> PipelineConfig:
         "teacher_oof_folds",
         "teacher_min_train_rows",
         "teacher_epochs",
-        "group3_residual_epochs",
-        "group3_residual_ensemble",
-        "group3_residual_batch_size",
     )
     for option in positive_options:
         if values[option] < 1:
@@ -299,26 +249,6 @@ def parse_args() -> PipelineConfig:
         )
     if not 0.0 < values["history_decay"] <= 1.0:
         parser.error("--history-decay must be in (0, 1].")
-
-    if values["group3_residual_learning_rate"] <= 0.0:
-        parser.error("--group3-residual-learning-rate must be positive.")
-    if not 0.0 < values["group3_residual_max_abs_correction"] <= 1.0:
-        parser.error(
-            "--group3-residual-max-abs-correction must be in (0, 1]."
-        )
-
-    validation_start = pd.Timestamp(values["validation_start"])
-    comparison_start = pd.Timestamp(values["comparison_start"])
-    residual_validation_start = pd.Timestamp(
-        values["group3_residual_validation_start"]
-    )
-    if values["group3_residual"] and not (
-        validation_start < residual_validation_start < comparison_start
-    ):
-        parser.error(
-            "--validation-start < --group3-residual-validation-start "
-            "< --comparison-start is required."
-        )
 
     if values["temporal_group_dro"] and values["ficr_loss"] != "sigmoid":
         parser.error("--temporal-group-dro requires --ficr-loss sigmoid.")
@@ -393,11 +323,7 @@ def parse_args() -> PipelineConfig:
     output_dir = values.pop("output_dir")
     if output_dir is None:
         # Keep this experiment under Version 6.
-        suffix = (
-            "temporal_x_5h_teacher_y_5h_g3_residual"
-            if values["group3_residual"]
-            else "temporal_x_5h_teacher_y_5h_distillation"
-        )
+        suffix = "temporal_x_5h_teacher_y_5h_worst_group_ficr"
         output_dir = Path("model_outputs/v6") / suffix / "runs" / "_".join(models)
 
     return PipelineConfig(

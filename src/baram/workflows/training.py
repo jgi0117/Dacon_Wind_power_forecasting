@@ -1,4 +1,4 @@
-"""Teacher-student RealMLP training plus optional G3 residual correction."""
+"""Version 6 Teacher-Student RealMLP training with robust FICR reporting."""
 
 from __future__ import annotations
 
@@ -21,16 +21,14 @@ from ..metrics import (
     flatten_report,
 )
 from ..models import build_model
-from ..models.g3_residual_model import Group3ResidualRealMLP, G3_TARGET
 from ..splitting import SplitPlan, build_split_plan, delivery_month
 
 
 LOGGER = logging.getLogger("baram.pipeline")
 
 MULTITASK_STRATEGY = (
-    "v6-temporal-x-5h-student-privileged-same-group-y-teacher-distillation"
+    "v6-temporal-x-5h-teacher-single-epoch-selection-worst-group-ficr"
 )
-G3_RESIDUAL_NAME = "realmlp_g3_residual"
 
 
 def _json_default(value: Any) -> Any:
@@ -159,6 +157,12 @@ def _fit_validation_models(
                 ),
             )
         )
+        model_schedule["teacher"] = int(
+            model_metadata.get(
+                "teacher_selected_epoch",
+                config.teacher_epochs,
+            )
+        )
 
         predictions[model_name] = _restore_prediction_frame(
             model.predict(X_validation),
@@ -181,6 +185,7 @@ def _fit_validation_models(
 
         audit["runs"][model_name] = {
             "student_epoch": model_schedule["student"],
+            "teacher_epoch": model_schedule["teacher"],
             "teacher_oof": model_metadata.get("teacher_oof", {}),
         }
         audit.setdefault("selected_epochs", {})[model_name] = dict(
@@ -327,157 +332,73 @@ def _build_masks(
     )
 
 
-def _fit_g3_residual_validation(
+def _write_training_reports(
     config: PipelineConfig,
-    X_validation: pd.DataFrame,
-    y_validation: pd.DataFrame,
-    base_prediction: pd.DataFrame,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Fit residual on Jan-Jun, inspect Jul-Sep, evaluate on untouched Q4."""
-    residual_validation_start = pd.Timestamp(
-        config.group3_residual_validation_start
+    results: pd.DataFrame,
+    metadata: dict[str, dict[str, Any]],
+    iteration_schedule: dict[str, dict[str, int]],
+) -> None:
+    """Persist human-readable training reports directly under output_dir."""
+    # Compact experiment summary.
+    summary = results.copy()
+    summary["student_epoch"] = summary["model"].map(
+        lambda name: iteration_schedule.get(name, {}).get("student")
     )
-    comparison_start = pd.Timestamp(
-        config.comparison_start
+    summary["teacher_epoch"] = summary["model"].map(
+        lambda name: iteration_schedule.get(name, {}).get("teacher")
     )
-
-    observed = y_validation[G3_TARGET].notna()
-
-    train_mask = (
-        observed
-        & (X_validation.index < residual_validation_start)
-    )
-    tuning_mask = (
-        observed
-        & (X_validation.index >= residual_validation_start)
-        & (X_validation.index < comparison_start)
+    summary.to_csv(
+        config.output_dir / "training_report.csv",
+        index=False,
+        encoding="utf-8",
     )
 
-    if not train_mask.any():
-        raise ValueError(
-            "No rows are available for G3 residual training."
-        )
-    if not tuning_mask.any():
-        raise ValueError(
-            "No rows are available for G3 residual validation."
-        )
+    # Student selector epoch history.
+    history_rows: list[dict[str, Any]] = []
+    teacher_rows: list[dict[str, Any]] = []
+    for model_name, sections in metadata.items():
+        model_meta = sections.get("multitask", {})
+        selection = model_meta.get("student_selection", {})
+        history = selection.get("training_history", [])
+        if isinstance(history, list):
+            for row in history:
+                if isinstance(row, dict):
+                    history_rows.append({"model": model_name, **row})
 
-    model = Group3ResidualRealMLP(config)
+        teacher_oof = model_meta.get("teacher_oof", {})
+        teacher_selection = teacher_oof.get("teacher_epoch_selection", {})
+        if isinstance(teacher_selection, dict):
+            teacher_rows.append({
+                "model": model_name,
+                "row_type": "epoch_selection",
+                **teacher_selection,
+            })
+        folds = teacher_oof.get("folds", [])
+        if isinstance(folds, list):
+            for fold in folds:
+                if isinstance(fold, dict):
+                    teacher_rows.append({
+                        "model": model_name,
+                        "row_type": "oof_fold",
+                        **fold,
+                    })
 
-    LOGGER.info(
-        "G3 residual validation model: train=%d, tuning=%d, epochs=%d",
-        int(train_mask.sum()),
-        int(tuning_mask.sum()),
-        config.group3_residual_epochs,
+    pd.DataFrame(history_rows).to_csv(
+        config.output_dir / "student_training_history.csv",
+        index=False,
+        encoding="utf-8",
     )
-
-    model.fit(
-        X_validation.loc[train_mask],
-        base_prediction.loc[train_mask, G3_TARGET],
-        y_validation.loc[train_mask, G3_TARGET],
-        X_valid=X_validation.loc[tuning_mask],
-        base_prediction_valid_kw=base_prediction.loc[
-            tuning_mask,
-            G3_TARGET,
-        ],
-        actual_valid_kw=y_validation.loc[
-            tuning_mask,
-            G3_TARGET,
-        ],
+    pd.DataFrame(teacher_rows).to_csv(
+        config.output_dir / "teacher_oof_report.csv",
+        index=False,
+        encoding="utf-8",
     )
-
-    corrected = base_prediction.copy()
-    corrected[G3_TARGET] = model.correct_prediction_kw(
-        X_validation,
-        base_prediction[G3_TARGET],
-    )
-
-    metadata = model.metadata()
-    metadata.update(
-        {
-            "residual_train_start": (
-                X_validation.index[train_mask].min()
-            ),
-            "residual_train_end": (
-                X_validation.index[train_mask].max()
-            ),
-            "residual_validation_start": (
-                X_validation.index[tuning_mask].min()
-            ),
-            "residual_validation_end": (
-                X_validation.index[tuning_mask].max()
-            ),
-            "outer_comparison_start": comparison_start,
-            "outer_comparison_used_for_fit": False,
-        }
-    )
-
-    return corrected, metadata
-
-
-def _fit_g3_residual_final(
-    config: PipelineConfig,
-    X_validation: pd.DataFrame,
-    y_validation: pd.DataFrame,
-    base_validation_prediction: pd.DataFrame,
-    X_test: pd.DataFrame,
-    base_test_prediction: pd.DataFrame,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Refit residual on all available 2024 OOS base predictions."""
-    observed = y_validation[G3_TARGET].notna()
-
-    if not observed.any():
-        raise ValueError(
-            "No observed group 3 labels for final residual fit."
-        )
-
-    model = Group3ResidualRealMLP(config)
-
-    LOGGER.info(
-        "G3 residual final refit: rows=%d / epochs=%d",
-        int(observed.sum()),
-        config.group3_residual_epochs,
-    )
-
-    model.fit(
-        X_validation.loc[observed],
-        base_validation_prediction.loc[
-            observed,
-            G3_TARGET,
-        ],
-        y_validation.loc[
-            observed,
-            G3_TARGET,
-        ],
-    )
-
-    corrected_test = base_test_prediction.copy()
-    corrected_test[G3_TARGET] = model.correct_prediction_kw(
-        X_test,
-        base_test_prediction[G3_TARGET],
-    )
-
-    metadata = model.metadata()
-    metadata.update(
-        {
-            "final_residual_fit_start": (
-                X_validation.index[observed].min()
-            ),
-            "final_residual_fit_end": (
-                X_validation.index[observed].max()
-            ),
-            "final_residual_fit_rows": int(observed.sum()),
-            "test_rows": int(len(X_test)),
-        }
-    )
-
-    return corrected_test, metadata
 
 
 def run_pipeline(
     config: PipelineConfig,
 ) -> pd.DataFrame:
-    """Run Version 6 base model and optional G3 residual experiment."""
+    """Run Version 6 Teacher-Student RealMLP experiment."""
     config.output_dir.mkdir(
         parents=True,
         exist_ok=True,
@@ -502,10 +423,6 @@ def run_pipeline(
             "Duplicate model names are not allowed."
         )
 
-    if config.group3_residual and tuple(config.models) != ("realmlp",):
-        raise ValueError(
-            "G3 residual experiment currently requires --models realmlp."
-        )
 
     X_train, y_train, X_test = load_artifacts(
         config.artifacts_dir
@@ -594,23 +511,6 @@ def run_pipeline(
         iteration_schedule,
     )
 
-    residual_validation_metadata: dict[str, Any] | None = None
-
-    if config.group3_residual:
-        base_validation_prediction = validation_predictions["realmlp"]
-
-        corrected_validation, residual_validation_metadata = (
-            _fit_g3_residual_validation(
-                config,
-                X_validation,
-                y_validation,
-                base_validation_prediction,
-            )
-        )
-
-        validation_predictions[
-            G3_RESIDUAL_NAME
-        ] = corrected_validation
 
     comparison_predictions = {
         name: frame.loc[
@@ -737,9 +637,6 @@ def run_pipeline(
         "iteration_selection": iteration_audit,
         "iteration_schedule": iteration_schedule,
         "model_metadata": metadata,
-        "g3_residual_validation": (
-            residual_validation_metadata
-        ),
         "evaluation_reports": reports,
     }
 
@@ -754,6 +651,13 @@ def run_pipeline(
             default=_json_default,
         ),
         encoding="utf-8",
+    )
+
+    _write_training_reports(
+        config,
+        results,
+        metadata,
+        iteration_schedule,
     )
 
     LOGGER.info(
@@ -784,50 +688,20 @@ def run_pipeline(
             / f"submission_{model_name}.csv",
         )
 
-    if config.group3_residual:
-        base_validation_prediction = (
-            validation_predictions["realmlp"]
-        )
-        base_test_prediction = (
-            base_test_predictions["realmlp"]
-        )
+    report_payload["submission_files"] = {
+        model_name: str(config.output_dir / f"submission_{model_name}.csv")
+        for model_name in base_test_predictions
+    }
+    (config.output_dir / "run_report.json").write_text(
+        json.dumps(
+            report_payload,
+            ensure_ascii=False,
+            indent=2,
+            default=_json_default,
+        ),
+        encoding="utf-8",
+    )
 
-        (
-            corrected_test_prediction,
-            final_residual_metadata,
-        ) = _fit_g3_residual_final(
-            config,
-            X_validation,
-            y_validation,
-            base_validation_prediction,
-            X_test,
-            base_test_prediction,
-        )
-
-        write_submission(
-            config.data_dir
-            / "sample_submission.csv",
-            corrected_test_prediction,
-            config.output_dir
-            / f"submission_{G3_RESIDUAL_NAME}.csv",
-        )
-
-        report_payload[
-            "g3_residual_final"
-        ] = final_residual_metadata
-
-        (
-            config.output_dir
-            / "run_report.json"
-        ).write_text(
-            json.dumps(
-                report_payload,
-                ensure_ascii=False,
-                indent=2,
-                default=_json_default,
-            ),
-            encoding="utf-8",
-        )
 
     LOGGER.info(
         "submission files created: output=%s",
