@@ -8,8 +8,6 @@ import pandas as pd
 
 from .metrics import TARGET_COLS
 
-from baram.constants import TARGET_COLS
-
 
 def load_artifacts(
     artifacts_dir: Path,
@@ -28,7 +26,6 @@ def load_artifacts(
         "X_test": artifacts_dir / "X_test.pkl",
     }
 
-    # parquet 우선
     if all(path.exists() for path in parquet_paths.values()):
         print(f"[data] Loading parquet artifacts from: {artifacts_dir}")
 
@@ -36,7 +33,6 @@ def load_artifacts(
         y_train = pd.read_parquet(parquet_paths["y_train"])
         X_test = pd.read_parquet(parquet_paths["X_test"])
 
-    # 기존 pickle fallback
     elif all(path.exists() for path in pickle_paths.values()):
         print(f"[data] Loading pickle artifacts from: {artifacts_dir}")
 
@@ -45,15 +41,8 @@ def load_artifacts(
         X_test = pd.read_pickle(pickle_paths["X_test"])
 
     else:
-        missing = [
-            str(path)
-            for path in parquet_paths.values()
-            if not path.exists()
-        ]
-
         raise FileNotFoundError(
-            "전처리 산출물을 찾을 수 없습니다. "
-            f"Parquet missing: {missing}"
+            f"전처리 산출물을 찾을 수 없습니다: {artifacts_dir}"
         )
 
     if not X_train.index.equals(y_train.index):
