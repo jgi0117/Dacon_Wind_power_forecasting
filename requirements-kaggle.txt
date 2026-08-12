@@ -1,0 +1,11 @@
+# Kaggle minimal dependencies for Version 6.
+#
+# Do NOT pin or reinstall torch / numpy / pandas / scipy / scikit-learn here.
+# Kaggle already ships a CUDA-compatible scientific stack. Reinstalling those
+# packages can break the notebook GPU environment.
+
+pytabkit==1.7.3
+kditransform
+hyperopt
+openpyxl>=3.1
+huggingface-hub
