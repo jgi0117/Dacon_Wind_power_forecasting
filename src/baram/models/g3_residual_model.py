@@ -398,7 +398,7 @@ class Group3ResidualRealMLP:
 
                 # Keep useful training logs,
                 # but suppress verbose feature/schema dump.
-                verbosity=1,
+                verbosity=0,
             )
         )
 

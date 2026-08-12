@@ -526,7 +526,7 @@ class RealMLPModel(RegressionModel):
             val_metric_name=_VAL_FICR_LOSS,
             use_early_stopping=False,
             stop_epoch=None if has_validation else self.epochs,
-            verbosity=1,
+            verbosity=0,
         )
 
         try:
