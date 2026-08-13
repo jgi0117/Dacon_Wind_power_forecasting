@@ -1143,7 +1143,7 @@ class DistilledTemporalRealMLPModel(RegressionModel):
             self.config,
             epochs=self.config.max_epochs,
         )
-        with _worst_group_ficr_scope(0.20):
+        with _worst_group_ficr_scope(float(self.config.worst_group_ficr_reg_weight)):
             student_selector.fit(
                 student_X_fit,
                 distilled_y_fit,
@@ -1225,7 +1225,7 @@ class DistilledTemporalRealMLPModel(RegressionModel):
             self.config,
             epochs=self.student_epochs,
         )
-        with _worst_group_ficr_scope(0.20):
+        with _worst_group_ficr_scope(float(self.config.worst_group_ficr_reg_weight)):
             self.student_model.fit(
                 student_X_fit,
                 distilled_y_fit,
@@ -1261,7 +1261,7 @@ class DistilledTemporalRealMLPModel(RegressionModel):
             self.config,
             epochs=self.student_epochs,
         )
-        with _worst_group_ficr_scope(0.20):
+        with _worst_group_ficr_scope(float(self.config.worst_group_ficr_reg_weight)):
             self.student_model.fit(
                 student_X_fit,
                 distilled_y_fit,
@@ -1410,7 +1410,9 @@ class DistilledTemporalRealMLPModel(RegressionModel):
             "distillation_teacher_weight": float(
                 self.config.distillation_teacher_weight
             ),
-            "student_worst_group_ficr_reg_weight": 0.20,
+            "student_worst_group_ficr_reg_weight": float(
+                self.config.worst_group_ficr_reg_weight
+            ),
             "teacher_worst_group_ficr_reg_weight": 0.0,
             "student_best_iteration": int(
                 self.student_epochs

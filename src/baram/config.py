@@ -34,6 +34,7 @@ class PipelineConfig:
     ficr_temperature: float = 0.01
     ficr_loss: str = "sigmoid"
     ficr_relu_margin: float = 0.005
+    worst_group_ficr_reg_weight: float = 0.50
 
     temporal_group_dro: bool = False
     temporal_group_dro_eta: float = 0.05
@@ -110,6 +111,15 @@ def parse_args() -> PipelineConfig:
         default="sigmoid",
     )
     parser.add_argument("--ficr-relu-margin", type=float, default=0.005)
+    parser.add_argument(
+        "--worst-group-ficr-reg-weight",
+        type=float,
+        default=0.50,
+        help=(
+            "Student-only coefficient for the FICR worst-group gap penalty. "
+            "Teacher training always uses 0.0."
+        ),
+    )
 
     parser.add_argument(
         "--temporal-group-dro",
@@ -256,6 +266,8 @@ def parse_args() -> PipelineConfig:
         parser.error("--ficr-temperature must be positive.")
     if not 0.0 <= values["ficr_relu_margin"] < 0.06:
         parser.error("--ficr-relu-margin must be in [0, 0.06).")
+    if values["worst_group_ficr_reg_weight"] < 0.0:
+        parser.error("--worst-group-ficr-reg-weight must be non-negative.")
     if values["temporal_group_dro_eta"] < 0.0:
         parser.error("--temporal-group-dro-eta must be non-negative.")
     if not 0.0 < values["group3_reliability_min_weight"] <= 1.0:

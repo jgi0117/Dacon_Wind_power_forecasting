@@ -19,7 +19,7 @@ CAPACITY_KWH = {
 # The penalty is the gap between the worst-group FICR loss and the mean-group
 # FICR loss. This prevents one group from being sacrificed while avoiding an
 # extra MAE penalty.
-WORST_GROUP_FICR_REG_WEIGHT = 0.20
+WORST_GROUP_FICR_REG_WEIGHT = 0.50
 
 
 def _validate_frames(answer: pd.DataFrame, prediction: pd.DataFrame) -> None:
