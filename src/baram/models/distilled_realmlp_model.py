@@ -15,10 +15,12 @@ Teacher input during training
 The Teacher therefore differs from the Student only by privileged target
 history. True target history is never used by the Student at inference.
 
-Teacher epoch selection is performed once on the earliest leakage-free
-chronological history. The selected epoch is then reused for every expanding
-OOF Teacher fold and for the final full-history distillation fit. Each OOF fold
-therefore trains the Teacher only once.
+During the validation-stage fit, every expanding chronological OOF Teacher
+fold selects its own epoch from an inner chronological train/validation split.
+The selected epoch is then used to refit that fold's Teacher on all history
+available before the OOF block. The resulting per-fold epochs are persisted and
+reused during the final full-history distillation fit, where Teacher epoch
+selection is intentionally skipped.
 
 The Student selector uses the external chronological validation window. The
 selected Student epoch is reused for the final refit.
@@ -489,22 +491,50 @@ class DistilledTemporalRealMLPModel(RegressionModel):
             group3_reliability_weighting=False,
         )
 
-        self.teacher_epoch_preselected = False
+        self.teacher_epochs = int(config.teacher_epochs)
+        self.teacher_fold_epochs_preselected = False
+        self.teacher_fold_epochs: list[int] = []
+
         if isinstance(iterations, dict):
             self.student_epochs = int(
                 iterations.get("student", config.max_epochs)
             )
-            if "teacher" in iterations:
-                self.teacher_epochs = int(iterations["teacher"])
-                self.teacher_epoch_preselected = True
-            else:
-                self.teacher_epochs = int(config.teacher_epochs)
+
+            raw_teacher_folds = iterations.get("teacher_folds")
+            if raw_teacher_folds is not None:
+                if not isinstance(raw_teacher_folds, (list, tuple)):
+                    raise TypeError(
+                        "iterations['teacher_folds'] must be a list or tuple."
+                    )
+                self.teacher_fold_epochs = [
+                    int(value) for value in raw_teacher_folds
+                ]
+                if not self.teacher_fold_epochs:
+                    raise ValueError(
+                        "iterations['teacher_folds'] must not be empty."
+                    )
+                if any(epoch < 1 for epoch in self.teacher_fold_epochs):
+                    raise ValueError(
+                        "Every preselected Teacher fold epoch must be >= 1."
+                    )
+                self.teacher_fold_epochs_preselected = True
+
+            # Backward compatibility with the previous single-Teacher schedule.
+            elif "teacher" in iterations:
+                scalar_epoch = int(iterations["teacher"])
+                if scalar_epoch < 1:
+                    raise ValueError(
+                        "Preselected Teacher epoch must be >= 1."
+                    )
+                self.teacher_fold_epochs = [
+                    scalar_epoch
+                    for _ in range(int(config.teacher_oof_folds))
+                ]
+                self.teacher_fold_epochs_preselected = True
         elif iterations is None:
             self.student_epochs = int(config.max_epochs)
-            self.teacher_epochs = int(config.teacher_epochs)
         else:
             self.student_epochs = int(iterations)
-            self.teacher_epochs = int(config.teacher_epochs)
 
         self.teacher_selection_metadata: dict[str, Any] = {}
 
@@ -563,111 +593,66 @@ class DistilledTemporalRealMLPModel(RegressionModel):
         )
 
         privileged_X = _append_teacher_target_history(
-            student_X, y, history_hours
+            student_X,
+            y,
+            history_hours,
         )
         eligibility = _group_teacher_eligibility(
-            privileged_X, y, history_hours
+            privileged_X,
+            y,
+            history_hours,
         )
         any_eligible = _any_group_eligible(eligibility)
         prior_counts = _prior_group_counts(eligibility)
         candidate_mask = _prediction_candidate_mask(
-            eligibility, prior_counts, min_group_rows
+            eligibility,
+            prior_counts,
+            min_group_rows,
         )
         candidate_positions = np.flatnonzero(candidate_mask)
 
         oof = pd.DataFrame(
-            np.nan, index=student_X.index, columns=TARGET_COLS, dtype=np.float32
+            np.nan,
+            index=student_X.index,
+            columns=TARGET_COLS,
+            dtype=np.float32,
         )
+
         eligible_rows_by_target = {
             target: int(np.count_nonzero(eligibility[target]))
             for target in TARGET_COLS
         }
         first_ready_timestamp_by_target: dict[str, pd.Timestamp | None] = {}
+
         for target in TARGET_COLS:
-            ready_mask = eligibility[target] & (prior_counts[target] >= min_group_rows)
+            ready_mask = (
+                eligibility[target]
+                & (prior_counts[target] >= min_group_rows)
+            )
             ready_positions = np.flatnonzero(ready_mask)
             first_ready_timestamp_by_target[target] = (
                 student_X.index[int(ready_positions[0])]
-                if len(ready_positions) else None
+                if len(ready_positions)
+                else None
             )
 
         if len(candidate_positions) == 0:
             self.teacher_oof_metadata = {
                 "enabled": False,
                 "reason": "no-group-reached-minimum-teacher-training-rows",
-                "student_history_hours": int(self.config.student_history_hours),
+                "student_history_hours": int(
+                    self.config.student_history_hours
+                ),
                 "teacher_target_history_hours": history_hours,
                 "history_decay": float(self.config.history_decay),
                 "min_train_rows_semantics": "per-group",
                 "min_train_rows_per_group": min_group_rows,
                 "eligible_rows_by_target": eligible_rows_by_target,
-                "first_ready_timestamp_by_target": first_ready_timestamp_by_target,
+                "first_ready_timestamp_by_target": (
+                    first_ready_timestamp_by_target
+                ),
             }
             return oof
-
-        # Select the Teacher epoch only once during the validation-stage fit.
-        # Final fit receives the selected Teacher epoch through iteration_schedule.
-        if not self.teacher_epoch_preselected:
-            selection_cutoff = int(candidate_positions[0])
-            selection_mask = any_eligible.copy()
-            selection_mask[selection_cutoff:] = False
-            selection_positions = np.flatnonzero(selection_mask)
-            if len(selection_positions) < 2:
-                raise ValueError(
-                    "Teacher global epoch selection requires at least two "
-                    "chronological history rows before the first OOF block."
-                )
-            inner_train_positions, inner_valid_positions = _chronological_inner_split(
-                selection_positions, inner_validation_fraction
-            )
-            teacher_selector = GroupConditionedRealMLPModel(
-                self.config, epochs=int(self.config.teacher_epochs)
-            )
-            with _worst_group_ficr_scope(0.0):
-                teacher_selector.fit(
-                    privileged_X.iloc[inner_train_positions],
-                    y.iloc[inner_train_positions],
-                    privileged_X.iloc[inner_valid_positions],
-                    y.iloc[inner_valid_positions],
-                )
-            selector_metadata = teacher_selector.metadata()
-            selected_teacher_epoch, selected_validation_loss, history_rows = (
-                _best_epoch_from_metadata(
-                    selector_metadata, int(self.config.teacher_epochs)
-                )
-            )
-            self.teacher_epochs = int(selected_teacher_epoch)
-            self.teacher_epoch_preselected = True
-            self.teacher_selection_metadata = {
-                "source": "single-global-chronological-inner-validation",
-                "selected_epoch": int(selected_teacher_epoch),
-                "max_epochs": int(self.config.teacher_epochs),
-                "validation_loss": selected_validation_loss,
-                "selection_history_rows": int(history_rows),
-                "inner_train_rows": int(len(inner_train_positions)),
-                "inner_validation_rows": int(len(inner_valid_positions)),
-                "inner_train_start": student_X.index[int(inner_train_positions[0])],
-                "inner_train_end": student_X.index[int(inner_train_positions[-1])],
-                "inner_validation_start": student_X.index[int(inner_valid_positions[0])],
-                "inner_validation_end": student_X.index[int(inner_valid_positions[-1])],
-            }
-            LOGGER.info(
-                "Teacher global epoch selection: selected_epoch=%d/%d, "
-                "validation_loss=%s",
-                self.teacher_epochs,
-                int(self.config.teacher_epochs),
-                (f"{selected_validation_loss:.8f}"
-                 if selected_validation_loss is not None else "N/A"),
-            )
-        else:
-            self.teacher_selection_metadata = {
-                "source": "reused-from-validation-iteration-schedule",
-                "selected_epoch": int(self.teacher_epochs),
-            }
-            LOGGER.info(
-                "Teacher epoch reused from validation stage: epochs=%d",
-                self.teacher_epochs,
-            )
 
         n_folds = int(self.config.teacher_oof_folds)
         folds = [
@@ -675,14 +660,33 @@ class DistilledTemporalRealMLPModel(RegressionModel):
             for fold in np.array_split(candidate_positions, n_folds)
             if len(fold) > 0
         ]
-        fold_metadata: list[dict[str, Any]] = []
 
-        for fold_number, fold_positions in enumerate(folds, start=1):
+        if self.teacher_fold_epochs_preselected:
+            if len(self.teacher_fold_epochs) != len(folds):
+                raise ValueError(
+                    "Preselected Teacher fold epoch count does not match "
+                    f"OOF folds: {len(self.teacher_fold_epochs)} != "
+                    f"{len(folds)}."
+                )
+            LOGGER.info(
+                "Teacher fold epochs reused from validation stage: %s",
+                self.teacher_fold_epochs,
+            )
+        else:
+            self.teacher_fold_epochs = []
+
+        fold_metadata: list[dict[str, Any]] = []
+        selection_metadata: list[dict[str, Any]] = []
+
+        for fold_index, fold_positions in enumerate(folds):
+            fold_number = fold_index + 1
             fold_start_position = int(fold_positions[0])
             fold_end_position = int(fold_positions[-1])
+
             train_mask = any_eligible.copy()
             train_mask[fold_start_position:] = False
             train_positions = np.flatnonzero(train_mask)
+
             if len(train_positions) < 1:
                 LOGGER.warning(
                     "Teacher fold %d skipped: no chronological history.",
@@ -691,18 +695,128 @@ class DistilledTemporalRealMLPModel(RegressionModel):
                 continue
 
             group_train_counts = _group_train_counts_before(
-                eligibility, fold_start_position
+                eligibility,
+                fold_start_position,
             )
             ready_groups = [
-                target for target in TARGET_COLS
+                target
+                for target in TARGET_COLS
                 if group_train_counts[target] >= min_group_rows
             ]
             if not ready_groups:
+                LOGGER.warning(
+                    "Teacher fold %d skipped: no group has enough history.",
+                    fold_number,
+                )
                 continue
 
-            # Exactly one Teacher fit per OOF fold. No per-fold selector/refit pair.
+            selected_validation_loss: float | None = None
+            selection_history_rows = 0
+            inner_train_positions: np.ndarray | None = None
+            inner_valid_positions: np.ndarray | None = None
+
+            if self.teacher_fold_epochs_preselected:
+                selected_teacher_epoch = int(
+                    self.teacher_fold_epochs[fold_index]
+                )
+                selection_source = (
+                    "reused-from-validation-fold-epoch-schedule"
+                )
+            else:
+                (
+                    inner_train_positions,
+                    inner_valid_positions,
+                ) = _chronological_inner_split(
+                    train_positions,
+                    inner_validation_fraction,
+                )
+
+                teacher_selector = GroupConditionedRealMLPModel(
+                    self.config,
+                    epochs=int(self.config.teacher_epochs),
+                )
+                with _worst_group_ficr_scope(0.0):
+                    teacher_selector.fit(
+                        privileged_X.iloc[inner_train_positions],
+                        y.iloc[inner_train_positions],
+                        privileged_X.iloc[inner_valid_positions],
+                        y.iloc[inner_valid_positions],
+                    )
+
+                selector_metadata = teacher_selector.metadata()
+                (
+                    selected_teacher_epoch,
+                    selected_validation_loss,
+                    selection_history_rows,
+                ) = _best_epoch_from_metadata(
+                    selector_metadata,
+                    int(self.config.teacher_epochs),
+                )
+                selected_teacher_epoch = int(selected_teacher_epoch)
+                self.teacher_fold_epochs.append(
+                    selected_teacher_epoch
+                )
+                selection_source = (
+                    "per-fold-chronological-inner-validation"
+                )
+
+                LOGGER.info(
+                    "Teacher fold %d epoch selection: "
+                    "inner_train=%d, inner_valid=%d, "
+                    "selected_epoch=%d/%d, validation_loss=%s",
+                    fold_number,
+                    len(inner_train_positions),
+                    len(inner_valid_positions),
+                    selected_teacher_epoch,
+                    int(self.config.teacher_epochs),
+                    (
+                        f"{selected_validation_loss:.8f}"
+                        if selected_validation_loss is not None
+                        else "N/A"
+                    ),
+                )
+
+            selection_row: dict[str, Any] = {
+                "fold": fold_number,
+                "source": selection_source,
+                "selected_epoch": selected_teacher_epoch,
+                "max_epochs": int(self.config.teacher_epochs),
+                "validation_loss": selected_validation_loss,
+                "selection_history_rows": int(selection_history_rows),
+            }
+
+            if (
+                inner_train_positions is not None
+                and inner_valid_positions is not None
+            ):
+                selection_row.update({
+                    "inner_train_rows": int(
+                        len(inner_train_positions)
+                    ),
+                    "inner_validation_rows": int(
+                        len(inner_valid_positions)
+                    ),
+                    "inner_train_start": student_X.index[
+                        int(inner_train_positions[0])
+                    ],
+                    "inner_train_end": student_X.index[
+                        int(inner_train_positions[-1])
+                    ],
+                    "inner_validation_start": student_X.index[
+                        int(inner_valid_positions[0])
+                    ],
+                    "inner_validation_end": student_X.index[
+                        int(inner_valid_positions[-1])
+                    ],
+                })
+
+            selection_metadata.append(selection_row)
+
+            # Validation stage: selector + refit.
+            # Final stage: selector is skipped; only this refit-equivalent fit runs.
             teacher = GroupConditionedRealMLPModel(
-                self.config, epochs=self.teacher_epochs
+                self.config,
+                epochs=selected_teacher_epoch,
             )
             with _worst_group_ficr_scope(0.0):
                 teacher.fit(
@@ -711,7 +825,10 @@ class DistilledTemporalRealMLPModel(RegressionModel):
                 )
 
             fold_X = privileged_X.iloc[fold_positions]
-            fold_prediction = _prediction_frame(teacher, fold_X)
+            fold_prediction = _prediction_frame(
+                teacher,
+                fold_X,
+            )
             fold_prediction = _mask_fold_predictions_by_group_readiness(
                 fold_prediction,
                 fold_positions=fold_positions,
@@ -719,11 +836,18 @@ class DistilledTemporalRealMLPModel(RegressionModel):
                 group_train_counts=group_train_counts,
                 min_group_rows=min_group_rows,
             )
-            oof.loc[fold_prediction.index, TARGET_COLS] = fold_prediction.to_numpy()
+            oof.loc[
+                fold_prediction.index,
+                TARGET_COLS,
+            ] = fold_prediction.to_numpy()
+
             per_group_predictions = {
-                target: int(fold_prediction[target].notna().sum())
+                target: int(
+                    fold_prediction[target].notna().sum()
+                )
                 for target in TARGET_COLS
             }
+
             fold_metadata.append({
                 "fold": fold_number,
                 "train_timestamp_rows": int(len(train_positions)),
@@ -731,39 +855,100 @@ class DistilledTemporalRealMLPModel(RegressionModel):
                 "group_train_rows": group_train_counts,
                 "ready_groups": ready_groups,
                 "predicted_cells_by_target": per_group_predictions,
-                "train_start": student_X.index[int(train_positions[0])],
-                "train_end": student_X.index[int(train_positions[-1])],
-                "prediction_start": student_X.index[fold_start_position],
-                "prediction_end": student_X.index[fold_end_position],
-                "teacher_epochs": int(self.teacher_epochs),
-                "teacher_fit_count": 1,
+                "train_start": student_X.index[
+                    int(train_positions[0])
+                ],
+                "train_end": student_X.index[
+                    int(train_positions[-1])
+                ],
+                "prediction_start": student_X.index[
+                    fold_start_position
+                ],
+                "prediction_end": student_X.index[
+                    fold_end_position
+                ],
+                "teacher_epochs": selected_teacher_epoch,
+                "teacher_fit_count": (
+                    1 if self.teacher_fold_epochs_preselected else 2
+                ),
+                "epoch_selection_reused": bool(
+                    self.teacher_fold_epochs_preselected
+                ),
             })
 
-        predicted_rows = int(oof.notna().any(axis=1).sum())
-        predicted_cells_by_target = {
-            target: int(oof[target].notna().sum()) for target in TARGET_COLS
+        if (
+            not self.teacher_fold_epochs_preselected
+            and len(self.teacher_fold_epochs) != len(folds)
+        ):
+            raise RuntimeError(
+                "Validation Teacher epoch selection did not produce one "
+                "epoch for every OOF fold."
+            )
+
+        self.teacher_selection_metadata = {
+            "source": (
+                "validation-per-fold-selection"
+                if not self.teacher_fold_epochs_preselected
+                else "final-reuse-validation-fold-epochs"
+            ),
+            "selected_epochs": [
+                int(epoch)
+                for epoch in self.teacher_fold_epochs
+            ],
+            "folds": selection_metadata,
         }
+
+        predicted_rows = int(
+            oof.notna().any(axis=1).sum()
+        )
+        predicted_cells_by_target = {
+            target: int(oof[target].notna().sum())
+            for target in TARGET_COLS
+        }
+
         self.teacher_oof_metadata = {
             "enabled": predicted_rows > 0,
-            "student_history_hours": int(self.config.student_history_hours),
+            "student_history_hours": int(
+                self.config.student_history_hours
+            ),
             "teacher_target_history_hours": history_hours,
             "history_decay": float(self.config.history_decay),
-            "history_scope": "shared-temporal-X + same-group-target-only",
-            "teacher_selected_epoch": int(self.teacher_epochs),
-            "teacher_epoch_selection": self.teacher_selection_metadata,
-            "teacher_oof_fit_policy": "one-fit-per-fold-fixed-epoch",
-            "teacher_inner_validation_fraction": inner_validation_fraction,
+            "history_scope": (
+                "shared-temporal-X + same-group-target-only"
+            ),
+            "teacher_selected_epochs": [
+                int(epoch)
+                for epoch in self.teacher_fold_epochs
+            ],
+            "teacher_epoch_selection": (
+                self.teacher_selection_metadata
+            ),
+            "teacher_oof_fit_policy": (
+                "validation-selector-plus-refit-per-fold"
+                if not self.teacher_fold_epochs_preselected
+                else "final-one-fit-per-fold-reuse-validation-epochs"
+            ),
+            "teacher_inner_validation_fraction": (
+                inner_validation_fraction
+            ),
             "oof_folds_requested": n_folds,
             "oof_folds_completed": len(fold_metadata),
             "min_train_rows_semantics": "per-group",
             "min_train_rows_per_group": min_group_rows,
-            "eligible_timestamp_rows_any_group": int(np.count_nonzero(any_eligible)),
+            "eligible_timestamp_rows_any_group": int(
+                np.count_nonzero(any_eligible)
+            ),
             "eligible_rows_by_target": eligible_rows_by_target,
-            "first_ready_timestamp_by_target": first_ready_timestamp_by_target,
+            "first_ready_timestamp_by_target": (
+                first_ready_timestamp_by_target
+            ),
             "oof_prediction_rows": predicted_rows,
-            "oof_prediction_cells_by_target": predicted_cells_by_target,
+            "oof_prediction_cells_by_target": (
+                predicted_cells_by_target
+            ),
             "folds": fold_metadata,
         }
+
         return oof
 
     def _distilled_targets(
@@ -1071,13 +1256,18 @@ class DistilledTemporalRealMLPModel(RegressionModel):
                 self.config.history_decay
             ),
             "teacher_max_epochs": int(self.config.teacher_epochs),
-            "teacher_selected_epoch": int(self.teacher_epochs),
-            "teacher_epoch_preselected": bool(self.teacher_epoch_preselected),
+            "teacher_selected_epochs": [
+                int(epoch)
+                for epoch in self.teacher_fold_epochs
+            ],
+            "teacher_fold_epochs_preselected": bool(
+                self.teacher_fold_epochs_preselected
+            ),
             "teacher_inner_validation_fraction": float(
                 self.config.teacher_inner_validation_fraction
             ),
             "teacher_epoch_selection": (
-                "single-global-chronological-validation-then-reuse"
+                "validation-per-fold-selection-final-reuse"
             ),
             "teacher_selection_metadata": self.teacher_selection_metadata,
             "teacher_min_train_rows_semantics": "per-group",

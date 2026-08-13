@@ -27,7 +27,7 @@ from ..splitting import SplitPlan, build_split_plan, delivery_month
 LOGGER = logging.getLogger("baram.pipeline")
 
 MULTITASK_STRATEGY = (
-    "v6-temporal-x-5h-teacher-single-epoch-selection-worst-group-ficr"
+    "v6-temporal-x-5h-teacher-fold-epoch-selection-final-reuse-worst-group-ficr"
 )
 
 
@@ -80,11 +80,11 @@ def _fit_validation_models(
     X_validation: pd.DataFrame,
     y_validation: pd.DataFrame,
     early_stopping_mask: np.ndarray,
-    iteration_schedule: dict[str, dict[str, int]],
+    iteration_schedule: dict[str, dict[str, Any]],
 ) -> tuple[
     dict[str, pd.DataFrame],
     dict[str, dict[str, Any]],
-    dict[str, dict[str, int]],
+    dict[str, dict[str, Any]],
     list[dict[str, Any]],
     dict[str, Any],
 ]:
@@ -157,12 +157,25 @@ def _fit_validation_models(
                 ),
             )
         )
-        model_schedule["teacher"] = int(
-            model_metadata.get(
-                "teacher_selected_epoch",
-                config.teacher_epochs,
-            )
+        teacher_fold_epochs = model_metadata.get(
+            "teacher_selected_epochs",
+            [],
         )
+        if not isinstance(teacher_fold_epochs, list):
+            raise TypeError(
+                "teacher_selected_epochs metadata must be a list."
+            )
+        if len(teacher_fold_epochs) != int(config.teacher_oof_folds):
+            raise ValueError(
+                "Validation fit must select exactly one Teacher epoch "
+                "per configured OOF fold: "
+                f"{len(teacher_fold_epochs)} != "
+                f"{int(config.teacher_oof_folds)}."
+            )
+        model_schedule["teacher_folds"] = [
+            int(epoch)
+            for epoch in teacher_fold_epochs
+        ]
 
         predictions[model_name] = _restore_prediction_frame(
             model.predict(X_validation),
@@ -185,7 +198,9 @@ def _fit_validation_models(
 
         audit["runs"][model_name] = {
             "student_epoch": model_schedule["student"],
-            "teacher_epoch": model_schedule["teacher"],
+            "teacher_fold_epochs": list(
+                model_schedule["teacher_folds"]
+            ),
             "teacher_oof": model_metadata.get("teacher_oof", {}),
         }
         audit.setdefault("selected_epochs", {})[model_name] = dict(
@@ -206,7 +221,7 @@ def _fit_final_models(
     X_train: pd.DataFrame,
     y_train: pd.DataFrame,
     X_test: pd.DataFrame,
-    iteration_schedule: dict[str, dict[str, int]],
+    iteration_schedule: dict[str, dict[str, Any]],
     final_fit_cutoff: pd.Timestamp,
 ) -> dict[str, pd.DataFrame]:
     predictions: dict[str, pd.DataFrame] = {}
@@ -229,7 +244,8 @@ def _fit_final_models(
         iterations = iteration_schedule.get(model_name) or None
 
         LOGGER.info(
-            "최종 teacher-student 모델 학습 및 추론: "
+            "최종 teacher-student 모델 학습 및 추론 "
+            "(Teacher fold epoch selection 재실행 없음): "
             "%s / rows=%d / iterations=%s",
             model_name,
             len(X_joint),
@@ -336,7 +352,7 @@ def _write_training_reports(
     config: PipelineConfig,
     results: pd.DataFrame,
     metadata: dict[str, dict[str, Any]],
-    iteration_schedule: dict[str, dict[str, int]],
+    iteration_schedule: dict[str, dict[str, Any]],
 ) -> None:
     """Persist human-readable training reports directly under output_dir."""
     # Compact experiment summary.
@@ -344,8 +360,13 @@ def _write_training_reports(
     summary["student_epoch"] = summary["model"].map(
         lambda name: iteration_schedule.get(name, {}).get("student")
     )
-    summary["teacher_epoch"] = summary["model"].map(
-        lambda name: iteration_schedule.get(name, {}).get("teacher")
+    summary["teacher_fold_epochs"] = summary["model"].map(
+        lambda name: json.dumps(
+            iteration_schedule.get(name, {}).get(
+                "teacher_folds",
+                [],
+            )
+        )
     )
     summary.to_csv(
         config.output_dir / "training_report.csv",
@@ -366,13 +387,23 @@ def _write_training_reports(
                     history_rows.append({"model": model_name, **row})
 
         teacher_oof = model_meta.get("teacher_oof", {})
-        teacher_selection = teacher_oof.get("teacher_epoch_selection", {})
+        teacher_selection = teacher_oof.get(
+            "teacher_epoch_selection",
+            {},
+        )
         if isinstance(teacher_selection, dict):
-            teacher_rows.append({
-                "model": model_name,
-                "row_type": "epoch_selection",
-                **teacher_selection,
-            })
+            selection_folds = teacher_selection.get(
+                "folds",
+                [],
+            )
+            if isinstance(selection_folds, list):
+                for selection_fold in selection_folds:
+                    if isinstance(selection_fold, dict):
+                        teacher_rows.append({
+                            "model": model_name,
+                            "row_type": "epoch_selection",
+                            **selection_fold,
+                        })
         folds = teacher_oof.get("folds", [])
         if isinstance(folds, list):
             for fold in folds:
@@ -436,7 +467,7 @@ def run_pipeline(
 
     iteration_schedule: dict[
         str,
-        dict[str, int],
+        dict[str, Any],
     ] = {}
 
     (
