@@ -42,6 +42,7 @@ LOGGER = logging.getLogger("baram.pipeline")
 _SINGLE_TARGET_NAME = "capacity_factor"
 _SELF_HISTORY_PREFIX = "teacher_target__self__lag_"
 _GROUP_HISTORY_PREFIX = "teacher_target__"
+_LOSS_GROUP_CODE_COLUMN = "__baram_loss_group_code"
 
 
 def _group_history_columns(frame: pd.DataFrame) -> list[str]:
@@ -335,6 +336,14 @@ class GroupConditionedRealMLPModel(RegressionModel):
             if decorated.empty:
                 rows_by_target[target] = 0
                 continue
+
+            # Loss-only marker. RealMLPModel removes this column before
+            # PyTabKit sees the features; it is used only to reconstruct
+            # kpx_group_1/2/3 inside the long-format FICR objective.
+            decorated = decorated.copy()
+            decorated[_LOSS_GROUP_CODE_COLUMN] = float(
+                TARGET_COLS.index(target)
+            )
 
             blocks_X.append(
                 decorated

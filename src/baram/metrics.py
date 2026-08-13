@@ -434,3 +434,175 @@ def flatten_report(model_name: str, report: dict[str, Any]) -> dict[str, Any]:
         row[f"{target}__nmae"] = group["nmae"]
         row[f"{target}__ficr"] = group["ficr"]
     return row
+
+
+def long_group_ficr_aware_loss_torch(
+    actual: Any,
+    prediction: Any,
+    group_ids: Any,
+    *,
+    ficr_weight: float = 0.75,
+    temperature: float = 0.01,
+    worst_group_ficr_reg_weight: float | None = None,
+    n_groups: int = 3,
+) -> Any:
+    """FICR-aware loss for long-format shared-group training.
+
+    ``actual`` and ``prediction`` contain one capacity-factor target per row,
+    while ``group_ids`` identifies whether each row belongs to G1, G2 or G3.
+
+    MAE is kept as one global mean across all eligible rows. FICR is computed
+    independently for each group, and only the FICR term receives the
+    worst-group regularizer::
+
+        loss = (1-w) * global_MAE
+             + w * mean(group_FICR_loss)
+             + lambda * (worst_group_FICR_loss - mean_group_FICR_loss)
+
+    This is the correct formulation for the current long-format model, where
+    group identity lives on the row axis rather than the output axis.
+    """
+    import torch
+
+    if actual.ndim < prediction.ndim:
+        actual = actual.unsqueeze(0).expand_as(prediction)
+    elif prediction.ndim < actual.ndim:
+        prediction = prediction.unsqueeze(0).expand_as(actual)
+    if actual.shape != prediction.shape:
+        actual = torch.broadcast_to(actual, prediction.shape)
+
+    if actual.ndim < 2:
+        actual = actual.reshape(-1, 1)
+        prediction = prediction.reshape(-1, 1)
+
+    ids = group_ids
+    if not torch.is_tensor(ids):
+        ids = torch.as_tensor(ids, device=actual.device)
+    ids = ids.to(device=actual.device, dtype=torch.long)
+
+    # Reduce a trailing singleton metadata dimension when present.
+    if ids.ndim > 0 and ids.shape[-1] == 1:
+        ids = ids.squeeze(-1)
+
+    # Match ensemble/batch leading dimensions. The final capacity dimension is
+    # not part of group_ids.
+    desired_ndim = actual.ndim - 1
+    while ids.ndim < desired_ndim:
+        ids = ids.unsqueeze(0)
+    if ids.shape != actual.shape[:-1]:
+        ids = torch.broadcast_to(ids, actual.shape[:-1])
+
+    valid = (
+        torch.isfinite(actual)
+        & torch.isfinite(prediction)
+        & (actual >= 0.10)
+    )
+    safe_actual = torch.where(valid, actual, torch.zeros_like(actual))
+    safe_prediction = torch.where(valid, prediction, torch.zeros_like(prediction))
+    smooth_error = torch.sqrt((safe_prediction - safe_actual).square() + 1e-8)
+    valid_float = valid.to(smooth_error.dtype)
+
+    # Global MAE: deliberately NOT worst-group regularized.
+    global_count = valid_float.sum(dim=(-2, -1)).clamp_min(1.0)
+    global_mae = (smooth_error * valid_float).sum(dim=(-2, -1)) / global_count
+
+    sigmoid_6 = torch.sigmoid((0.06 - smooth_error) / temperature)
+    sigmoid_8 = torch.sigmoid((0.08 - smooth_error) / temperature)
+    soft_reward = (3.0 * sigmoid_8 + sigmoid_6) / 4.0
+
+    group_ficr_losses = []
+    group_valid_flags = []
+
+    for group_code in range(int(n_groups)):
+        row_mask = ids == group_code
+        group_mask = valid & row_mask.unsqueeze(-1)
+        group_actual_weight = torch.where(
+            group_mask,
+            safe_actual,
+            torch.zeros_like(safe_actual),
+        )
+        denominator = group_actual_weight.sum(dim=(-2, -1))
+        numerator = (
+            soft_reward * group_actual_weight
+        ).sum(dim=(-2, -1))
+        soft_ficr = numerator / denominator.clamp_min(1e-12)
+        group_ficr_losses.append(1.0 - soft_ficr)
+        group_valid_flags.append(denominator > 0.0)
+
+    group_ficr_loss = torch.stack(group_ficr_losses, dim=-1)
+    valid_groups = torch.stack(group_valid_flags, dim=-1)
+
+    mean_ficr_loss = _masked_mean(group_ficr_loss, valid_groups)
+    base_loss = (
+        (1.0 - ficr_weight) * global_mae
+        + ficr_weight * mean_ficr_loss
+    )
+
+    reg_weight = (
+        WORST_GROUP_FICR_REG_WEIGHT
+        if worst_group_ficr_reg_weight is None
+        else float(worst_group_ficr_reg_weight)
+    )
+    reg = _worst_group_gap(group_ficr_loss, valid_groups)
+    return base_loss + reg_weight * reg
+
+
+def long_group_competition_components_torch(
+    actual: Any,
+    prediction: Any,
+    group_ids: Any,
+    *,
+    n_groups: int = 3,
+) -> dict[int, tuple[Any, Any]]:
+    """Exact per-group NMAE/FICR for long-format validation logging."""
+    import torch
+
+    if actual.ndim < prediction.ndim:
+        actual = actual.unsqueeze(0).expand_as(prediction)
+    elif prediction.ndim < actual.ndim:
+        prediction = prediction.unsqueeze(0).expand_as(actual)
+    if actual.shape != prediction.shape:
+        actual = torch.broadcast_to(actual, prediction.shape)
+    if actual.ndim < 2:
+        actual = actual.reshape(-1, 1)
+        prediction = prediction.reshape(-1, 1)
+
+    ids = group_ids
+    if not torch.is_tensor(ids):
+        ids = torch.as_tensor(ids, device=actual.device)
+    ids = ids.to(device=actual.device, dtype=torch.long)
+    if ids.ndim > 0 and ids.shape[-1] == 1:
+        ids = ids.squeeze(-1)
+    while ids.ndim < actual.ndim - 1:
+        ids = ids.unsqueeze(0)
+    if ids.shape != actual.shape[:-1]:
+        ids = torch.broadcast_to(ids, actual.shape[:-1])
+
+    result: dict[int, tuple[Any, Any]] = {}
+    clipped = prediction.clamp(0.0, 1.0)
+
+    for group_code in range(int(n_groups)):
+        row_mask = ids == group_code
+        valid = (
+            torch.isfinite(actual)
+            & torch.isfinite(prediction)
+            & (actual >= 0.10)
+            & row_mask.unsqueeze(-1)
+        )
+        valid_float = valid.to(actual.dtype)
+        safe_actual = torch.where(valid, actual, torch.zeros_like(actual))
+        safe_prediction = torch.where(valid, clipped, torch.zeros_like(prediction))
+        error = (safe_prediction - safe_actual).abs()
+        count = valid_float.sum(dim=(-2, -1))
+        nmae = (error * valid_float).sum(dim=(-2, -1)) / count.clamp_min(1.0)
+        unit_price = torch.where(
+            error <= 0.06,
+            4.0,
+            torch.where(error <= 0.08, 3.0, 0.0),
+        )
+        numerator = (safe_actual * unit_price * valid_float).sum(dim=(-2, -1))
+        denominator = (safe_actual * 4.0 * valid_float).sum(dim=(-2, -1))
+        ficr = numerator / denominator.clamp_min(1e-12)
+        result[group_code] = (nmae, ficr)
+
+    return result
