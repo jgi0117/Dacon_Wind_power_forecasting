@@ -823,7 +823,7 @@ class DistilledTemporalRealMLPModel(RegressionModel):
                     self.config,
                     epochs=int(self.config.teacher_epochs),
                 )
-                with _worst_group_ficr_scope(0.0):
+                with _worst_group_ficr_scope(float(self.config.worst_group_ficr_reg_weight)):
                     teacher_selector.fit(
                         privileged_X.iloc[inner_train_positions],
                         y.iloc[inner_train_positions],
@@ -906,7 +906,7 @@ class DistilledTemporalRealMLPModel(RegressionModel):
                 self.config,
                 epochs=selected_teacher_epoch,
             )
-            with _worst_group_ficr_scope(0.0):
+            with _worst_group_ficr_scope(float(self.config.worst_group_ficr_reg_weight)):
                 teacher.fit(
                     privileged_X.iloc[train_positions],
                     y.iloc[train_positions],
