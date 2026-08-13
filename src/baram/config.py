@@ -57,6 +57,10 @@ class PipelineConfig:
     teacher_inner_validation_fraction: float = 0.20
     distillation_teacher_weight: float = 0.20
 
+    # Robust Student epoch selection over chronological sub-periods.
+    student_selection_periods: int = 3
+    student_selection_worst_period_weight: float = 0.20
+
     # Legacy correction options kept for compatibility.
     temporal_prediction_correction: bool = False
     correction_validation_start: str = "2024-07-01 01:00:00"
@@ -183,6 +187,24 @@ def parse_args() -> PipelineConfig:
         default=0.20,
         help="Weight of Teacher OOF prediction in the blended Student target.",
     )
+    parser.add_argument(
+        "--student-selection-periods",
+        type=int,
+        default=3,
+        help=(
+            "Number of contiguous chronological blocks used to select the "
+            "Student epoch inside the iteration-selection window."
+        ),
+    )
+    parser.add_argument(
+        "--student-selection-worst-period-weight",
+        type=float,
+        default=0.20,
+        help=(
+            "Penalty on the gap between mean and worst chronological "
+            "Student-selection block score."
+        ),
+    )
 
     parser.add_argument(
         "--enable-temporal-prediction-correction",
@@ -218,6 +240,7 @@ def parse_args() -> PipelineConfig:
         "teacher_oof_folds",
         "teacher_min_train_rows",
         "teacher_epochs",
+        "student_selection_periods",
     )
     for option in positive_options:
         if values[option] < 1:
@@ -243,6 +266,12 @@ def parse_args() -> PipelineConfig:
         parser.error("--activity-loss-weight must be non-negative.")
     if not 0.0 <= values["distillation_teacher_weight"] <= 1.0:
         parser.error("--distillation-teacher-weight must be between 0 and 1.")
+    if values["student_selection_periods"] < 2:
+        parser.error("--student-selection-periods must be at least 2.")
+    if not 0.0 <= values["student_selection_worst_period_weight"] <= 1.0:
+        parser.error(
+            "--student-selection-worst-period-weight must be between 0 and 1."
+        )
     if not 0.0 < values["teacher_inner_validation_fraction"] < 0.5:
         parser.error(
             "--teacher-inner-validation-fraction must be in (0, 0.5)."

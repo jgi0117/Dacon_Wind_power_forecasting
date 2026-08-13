@@ -31,7 +31,9 @@ _VAL_FICR_LOSS = 'baram_val_ficr_aware_loss'
 _MISSING_TARGET = -1.0
 _ACTIVITY_CODES_PER_BLOCK = 3
 _LOSS_GROUP_CODE_COLUMN = '__baram_loss_group_code'
+_LOSS_SELECTION_PERIOD_COLUMN = '__baram_loss_selection_period'
 _ACTIVITY_CODES_PER_GROUP = 3
+_ACTIVITY_CODES_PER_SELECTION_PERIOD = 9
 _REALMLP_TD_REG_PARAMS = {
     'hidden_sizes': [256] * 3,
     'max_one_hot_cat_size': 9,
@@ -147,6 +149,44 @@ def _unpack_activity_group_metadata(packed):
     )
     return activity, group_ids
 
+
+
+def _pack_activity_selection_period_metadata(activity, period_codes):
+    """Pack Student-selection chronological period IDs after group metadata."""
+    packed = np.array(activity, dtype=np.float32, copy=True)
+    if packed.ndim != 2 or packed.shape[1] != 1:
+        raise ValueError(
+            "Selection-period metadata requires one long-format target column."
+        )
+    codes = np.asarray(period_codes, dtype=np.float32).reshape(-1)
+    if len(codes) != len(packed):
+        raise ValueError(
+            f"Selection-period length mismatch: {len(codes)} != {len(packed)}"
+        )
+    if (codes < 0).any():
+        raise ValueError("Selection-period codes must be non-negative.")
+    packed[:, 0] = (
+        _ACTIVITY_CODES_PER_SELECTION_PERIOD * codes + packed[:, 0]
+    )
+    return packed
+
+
+def _unpack_activity_selection_period_metadata(packed):
+    """Decode Student-selection period IDs before group/activity metadata."""
+    import torch
+
+    encoded = packed[..., 0]
+    period_ids = torch.div(
+        encoded,
+        _ACTIVITY_CODES_PER_SELECTION_PERIOD,
+        rounding_mode='floor',
+    ).to(dtype=torch.long)
+    remainder = torch.remainder(
+        encoded, _ACTIVITY_CODES_PER_SELECTION_PERIOD
+    )
+    activity = packed.clone()
+    activity[..., 0] = remainder
+    return activity, period_ids
 
 def _pack_reliability_metadata(activity, reliability):
     '''Pack continuous per-target weights into activity target fractions.'''
@@ -272,6 +312,11 @@ class RealMLPModel(RegressionModel):
         X = X.copy()
         train_group_codes: np.ndarray | None = None
         valid_group_codes: np.ndarray | None = None
+        valid_selection_period_codes: np.ndarray | None = None
+
+        if _LOSS_SELECTION_PERIOD_COLUMN in X.columns:
+            # Selection-period metadata is validation-only by design.
+            X.pop(_LOSS_SELECTION_PERIOD_COLUMN)
 
         if _LOSS_GROUP_CODE_COLUMN in X.columns:
             train_group_codes = pd.to_numeric(
@@ -290,6 +335,10 @@ class RealMLPModel(RegressionModel):
 
         if X_valid is not None:
             X_valid = X_valid.copy()
+            if _LOSS_SELECTION_PERIOD_COLUMN in X_valid.columns:
+                valid_selection_period_codes = pd.to_numeric(
+                    X_valid.pop(_LOSS_SELECTION_PERIOD_COLUMN), errors='raise'
+                ).to_numpy(dtype=np.int64)
             if _LOSS_GROUP_CODE_COLUMN in X_valid.columns:
                 valid_group_codes = pd.to_numeric(
                     X_valid.pop(_LOSS_GROUP_CODE_COLUMN), errors='raise'
@@ -368,6 +417,14 @@ class RealMLPModel(RegressionModel):
                 predicted_capacity = y_pred[..., :n_targets]
                 actual_activity = actual[..., n_targets:2 * n_targets]
                 predicted_activity = y_pred[..., n_targets:2 * n_targets]
+                selection_period_ids = None
+                if (
+                    metric_name == _VAL_FICR_LOSS
+                    and valid_selection_period_codes is not None
+                ):
+                    actual_activity, selection_period_ids = (
+                        _unpack_activity_selection_period_metadata(actual_activity)
+                    )
                 loss_group_ids = None
                 if train_group_codes is not None:
                     actual_activity, loss_group_ids = (
@@ -572,6 +629,61 @@ class RealMLPModel(RegressionModel):
                         history[f'{target}__validation_ficr'] = float(
                             group_ficr.detach().mean().cpu()
                         )
+
+                if selection_period_ids is not None:
+                    period_codes = sorted(
+                        int(value)
+                        for value in torch.unique(selection_period_ids).detach().cpu().tolist()
+                    )
+                    for period_code in period_codes:
+                        period_mask = selection_period_ids == period_code
+                        period_actual = torch.where(
+                            period_mask.unsqueeze(-1),
+                            actual_capacity,
+                            torch.full_like(actual_capacity, _MISSING_TARGET),
+                        )
+                        if loss_group_ids is not None:
+                            period_components = (
+                                long_group_competition_components_torch(
+                                    period_actual,
+                                    predicted_capacity,
+                                    loss_group_ids,
+                                    n_groups=len(TARGET_COLS),
+                                )
+                            )
+                            period_group_nmae = torch.stack(
+                                [period_components[i][0] for i in range(len(TARGET_COLS))],
+                                dim=-1,
+                            )
+                            period_group_ficr = torch.stack(
+                                [period_components[i][1] for i in range(len(TARGET_COLS))],
+                                dim=-1,
+                            )
+                            period_nmae = period_group_nmae.mean(dim=-1)
+                            period_ficr = period_group_ficr.mean(dim=-1)
+                            period_score = (
+                                0.5 * (1.0 - period_nmae)
+                                + 0.5 * period_ficr
+                            )
+                        else:
+                            period_nmae, period_ficr = _competition_components(
+                                predicted_capacity, period_actual
+                            )
+                            period_score = (
+                                0.5 * (1.0 - period_nmae)
+                                + 0.5 * period_ficr
+                            )
+                        prefix = f'selection_period_{period_code + 1}'
+                        history[f'{prefix}__validation_score'] = float(
+                            period_score.detach().mean().cpu()
+                        )
+                        history[f'{prefix}__validation_nmae'] = float(
+                            period_nmae.detach().mean().cpu()
+                        )
+                        history[f'{prefix}__validation_ficr'] = float(
+                            period_ficr.detach().mean().cpu()
+                        )
+
                 if self.config.temporal_group_dro:
                     for block_id, losses in epoch_temporal_losses.items():
                         if losses:
@@ -663,6 +775,14 @@ class RealMLPModel(RegressionModel):
                 raise ValueError('Validation group codes are missing.')
             activity_y_val = _pack_activity_group_metadata(
                 activity_y_val, fit_group_codes_val
+            )
+        if valid_selection_period_codes is not None:
+            if not has_validation:
+                raise ValueError(
+                    'Selection-period metadata requires explicit validation data.'
+                )
+            activity_y_val = _pack_activity_selection_period_metadata(
+                activity_y_val, valid_selection_period_codes
             )
         packed_activity_y = (
             _pack_activity_block_metadata(activity_y, block_ids)

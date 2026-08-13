@@ -47,6 +47,8 @@ from .group_conditioned_realmlp_model import GroupConditionedRealMLPModel
 
 LOGGER = logging.getLogger("baram.pipeline")
 
+_LOSS_SELECTION_PERIOD_COLUMN = "__baram_loss_selection_period"
+
 _X_LAG_PREFIX = "student_feature__lag_"
 _X_WEIGHTED_PREFIX = "student_feature__weighted_recent__"
 _TEACHER_TARGET_PREFIX = "teacher_target__"
@@ -473,6 +475,92 @@ def _chronological_inner_split(
     return (
         train_positions[:split_at],
         train_positions[split_at:],
+    )
+
+
+def _chronological_selection_period_codes(
+    index: pd.Index,
+    n_periods: int,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Split a chronological validation window into contiguous equal blocks."""
+    if n_periods < 2:
+        raise ValueError("student_selection_periods must be at least 2.")
+    timestamps = pd.DatetimeIndex(index)
+    if not timestamps.is_monotonic_increasing:
+        raise ValueError("Student selection validation index must be chronological.")
+    if len(timestamps) < n_periods:
+        raise ValueError(
+            "Student selection validation rows must be >= student_selection_periods."
+        )
+    position_blocks = [
+        np.asarray(block, dtype=int)
+        for block in np.array_split(np.arange(len(timestamps)), n_periods)
+        if len(block) > 0
+    ]
+    codes = np.empty(len(timestamps), dtype=np.int64)
+    metadata: list[dict[str, Any]] = []
+    for code, positions in enumerate(position_blocks):
+        codes[positions] = code
+        metadata.append({
+            "period": code + 1,
+            "rows": int(len(positions)),
+            "start": timestamps[int(positions[0])],
+            "end": timestamps[int(positions[-1])],
+        })
+    return codes, metadata
+
+
+def _best_epoch_from_multi_period_metadata(
+    metadata: dict[str, Any],
+    max_epochs: int,
+    n_periods: int,
+    worst_period_weight: float,
+) -> tuple[int, float | None, float | None, int]:
+    """Choose Student epoch by mean chronological score plus worst-period robustness."""
+    history = metadata.get("training_history") or []
+    best_epoch = None
+    best_robust_score = None
+    best_mean_score = None
+    for row in history:
+        try:
+            epoch = int(row.get("step"))
+        except (TypeError, ValueError):
+            continue
+        scores: list[float] = []
+        valid_row = True
+        for period in range(1, n_periods + 1):
+            value = row.get(f"selection_period_{period}__validation_score")
+            try:
+                score = float(value)
+            except (TypeError, ValueError):
+                valid_row = False
+                break
+            if not np.isfinite(score):
+                valid_row = False
+                break
+            scores.append(score)
+        if not valid_row or not scores:
+            continue
+        mean_score = float(np.mean(scores))
+        worst_score = float(np.min(scores))
+        robust_score = (
+            mean_score
+            - float(worst_period_weight) * (mean_score - worst_score)
+        )
+        if best_robust_score is None or robust_score > best_robust_score:
+            best_epoch = epoch
+            best_robust_score = robust_score
+            best_mean_score = mean_score
+    if best_epoch is None:
+        fallback_epoch, fallback_loss, history_rows = _best_epoch_from_metadata(
+            metadata, max_epochs
+        )
+        return fallback_epoch, None, fallback_loss, history_rows
+    return (
+        max(1, min(int(best_epoch), int(max_epochs))),
+        float(best_robust_score),
+        float(best_mean_score),
+        int(len(history)),
     )
 
 
@@ -1041,6 +1129,16 @@ class DistilledTemporalRealMLPModel(RegressionModel):
                 "Student epoch-selection validation window is empty."
             )
 
+        tune_X = student_valid_X.loc[tune_mask].copy()
+        tune_y = y_valid.loc[tune_mask]
+        selection_period_codes, selection_period_metadata = (
+            _chronological_selection_period_codes(
+                tune_X.index,
+                int(self.config.student_selection_periods),
+            )
+        )
+        tune_X[_LOSS_SELECTION_PERIOD_COLUMN] = selection_period_codes
+
         student_selector = GroupConditionedRealMLPModel(
             self.config,
             epochs=self.config.max_epochs,
@@ -1049,19 +1147,39 @@ class DistilledTemporalRealMLPModel(RegressionModel):
             student_selector.fit(
                 student_X_fit,
                 distilled_y_fit,
-                student_valid_X.loc[tune_mask],
-                y_valid.loc[tune_mask],
+                tune_X,
+                tune_y,
             )
 
         selector_metadata = student_selector.metadata()
         (
             selected_student_epoch,
-            selected_validation_loss,
+            selected_robust_score,
+            selected_mean_period_score,
             selection_history_rows,
-        ) = _best_epoch_from_metadata(
+        ) = _best_epoch_from_multi_period_metadata(
             selector_metadata,
             int(self.config.max_epochs),
+            int(self.config.student_selection_periods),
+            float(self.config.student_selection_worst_period_weight),
         )
+
+        selected_history_row = next(
+            (
+                row
+                for row in (selector_metadata.get("training_history") or [])
+                if int(row.get("step", -1)) == int(selected_student_epoch)
+            ),
+            {},
+        )
+        selected_period_scores = {
+            f"period_{period}": selected_history_row.get(
+                f"selection_period_{period}__validation_score"
+            )
+            for period in range(
+                1, int(self.config.student_selection_periods) + 1
+            )
+        }
 
         self.student_selection_metadata = {
             **selector_metadata,
@@ -1070,26 +1188,37 @@ class DistilledTemporalRealMLPModel(RegressionModel):
             ),
             "best_iteration": int(selected_student_epoch),
             "best_iteration_source": (
-                "minimum training_history.validation_loss"
+                "multi-period chronological robust validation score"
             ),
-            "best_validation_loss": selected_validation_loss,
+            "selection_periods": selection_period_metadata,
+            "selection_period_count": int(self.config.student_selection_periods),
+            "worst_period_weight": float(
+                self.config.student_selection_worst_period_weight
+            ),
+            "best_robust_period_score": selected_robust_score,
+            "best_mean_period_score": selected_mean_period_score,
+            "selected_period_scores": selected_period_scores,
             "selection_history_rows": int(selection_history_rows),
         }
 
-        self.student_epochs = int(
-            selected_student_epoch
-        )
+        self.student_epochs = int(selected_student_epoch)
 
         LOGGER.info(
-            "Student epoch selection: selected_epoch=%d/%d, "
-            "validation_loss=%s",
+            "Student multi-period epoch selection: selected_epoch=%d/%d, "
+            "robust_score=%s, mean_period_score=%s, period_scores=%s",
             self.student_epochs,
             int(self.config.max_epochs),
             (
-                f"{selected_validation_loss:.8f}"
-                if selected_validation_loss is not None
+                f"{selected_robust_score:.8f}"
+                if selected_robust_score is not None
                 else "N/A"
             ),
+            (
+                f"{selected_mean_period_score:.8f}"
+                if selected_mean_period_score is not None
+                else "N/A"
+            ),
+            selected_period_scores,
         )
 
         self.student_model = GroupConditionedRealMLPModel(

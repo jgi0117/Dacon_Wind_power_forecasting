@@ -112,6 +112,10 @@ def _fit_validation_models(
         "teacher_history_hours": int(config.teacher_history_hours),
         "teacher_oof_folds": int(config.teacher_oof_folds),
         "teacher_weight": float(config.distillation_teacher_weight),
+        "student_selection_periods": int(config.student_selection_periods),
+        "student_selection_worst_period_weight": float(
+            config.student_selection_worst_period_weight
+        ),
         "student_epoch_window": splits[0],
         "outer_evaluation": "2024Q4",
         "runs": {},
