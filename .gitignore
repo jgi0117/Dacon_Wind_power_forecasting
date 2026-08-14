@@ -1,9 +1,6 @@
 # Raw data and generated model artifacts
-/data/test/
-/data/train/
-/data/data_description.md
-#/artifacts/
-#/artifacts_aggregate/
+/data/
+/artifacts/
 /model_outputs/
 
 # Python environments and caches
